@@ -1,0 +1,854 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LearnSite 2+ Design System Preview</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700;900&display=swap"
+    rel="stylesheet"
+  />
+  <style>
+    :root,
+    :root[data-style="workshop"] {
+      --font-body: "Noto Sans SC", sans-serif;
+      --font-heading: "Noto Sans SC", sans-serif;
+      --font-mono: "IBM Plex Mono", monospace;
+
+      --paper-0: #fffcf7;
+      --paper-1: #fbf7ee;
+      --paper-2: #f3ebdc;
+      --line: #d8ccb8;
+      --quiet: #7b7368;
+      --ink: #1f262b;
+      --primary: #1f6a5a;
+      --secondary: #f29a2e;
+      --accent: #2e7ad7;
+      --success: #2f9e6f;
+      --warning: #d98a1f;
+      --error: #c84b47;
+      --progress: #0e9aa7;
+      --hero-chip: rgba(31, 106, 90, 0.1);
+      --hero-gradient: linear-gradient(160deg, rgba(31, 106, 90, 0.18), rgba(255, 255, 255, 0.54));
+      --hero-border: rgba(31, 106, 90, 0.16);
+      --stage-glow-a: rgba(242, 154, 46, 0.18);
+      --stage-glow-b: rgba(31, 106, 90, 0.14);
+      --surface: rgba(255, 255, 255, 0.74);
+      --surface-strong: #fffaf1;
+      --shadow: 0 18px 48px rgba(58, 45, 29, 0.1);
+      --radius-sm: 12px;
+      --radius-md: 16px;
+      --radius-lg: 24px;
+      --bg:
+        radial-gradient(circle at top left, var(--stage-glow-a), transparent 24%),
+        radial-gradient(circle at top right, var(--stage-glow-b), transparent 22%),
+        var(--paper-0);
+      --theme-name: "Classroom Workshop";
+      --theme-summary: "暖纸面、课堂感、任务舞台";
+    }
+
+    :root[data-style="material"] {
+      --paper-0: #f7f9fc;
+      --paper-1: #ffffff;
+      --paper-2: #edf2f7;
+      --line: #d9e0e6;
+      --quiet: #5d6a75;
+      --ink: #17212b;
+      --primary: #1565c0;
+      --secondary: #26a69a;
+      --accent: #2f7ee6;
+      --success: #2e9d69;
+      --warning: #d88a16;
+      --error: #cf4d45;
+      --progress: #0097a7;
+      --hero-chip: rgba(21, 101, 192, 0.11);
+      --hero-gradient: linear-gradient(160deg, rgba(21, 101, 192, 0.16), rgba(255, 255, 255, 0.7));
+      --hero-border: rgba(21, 101, 192, 0.14);
+      --stage-glow-a: rgba(38, 166, 154, 0.16);
+      --stage-glow-b: rgba(21, 101, 192, 0.12);
+      --surface: rgba(255, 255, 255, 0.84);
+      --surface-strong: #ffffff;
+      --shadow: 0 20px 44px rgba(31, 55, 89, 0.1);
+      --radius-sm: 14px;
+      --radius-md: 18px;
+      --radius-lg: 28px;
+      --theme-name: "Material Design";
+      --theme-summary: "结构清晰、层次明确、现代规范";
+    }
+
+    :root[data-style="natural"] {
+      --paper-0: #fbf7ef;
+      --paper-1: #f7f2e7;
+      --paper-2: #eee4d2;
+      --line: #d9cbb4;
+      --quiet: #72685e;
+      --ink: #2c3328;
+      --primary: #506b2d;
+      --secondary: #c48b3a;
+      --accent: #688d5a;
+      --success: #5b9154;
+      --warning: #c27f29;
+      --error: #b85c41;
+      --progress: #6f8f60;
+      --hero-chip: rgba(80, 107, 45, 0.12);
+      --hero-gradient: linear-gradient(160deg, rgba(80, 107, 45, 0.16), rgba(255, 250, 240, 0.72));
+      --hero-border: rgba(80, 107, 45, 0.15);
+      --stage-glow-a: rgba(196, 139, 58, 0.16);
+      --stage-glow-b: rgba(80, 107, 45, 0.13);
+      --surface: rgba(255, 250, 241, 0.82);
+      --surface-strong: #f9f3e8;
+      --shadow: 0 18px 44px rgba(92, 74, 44, 0.11);
+      --radius-sm: 16px;
+      --radius-md: 20px;
+      --radius-lg: 30px;
+      --theme-name: "Natural";
+      --theme-summary: "大地色、有机感、自然温暖";
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: var(--font-body);
+      color: var(--ink);
+      background: var(--bg);
+      line-height: 1.5;
+    }
+
+    .shell {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 28px 20px 72px;
+    }
+
+    .topbar,
+    .section-header,
+    .mock-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .topbar {
+      margin-bottom: 28px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-weight: 700;
+    }
+
+    .brand-badge {
+      width: 48px;
+      height: 48px;
+      border-radius: 16px;
+      background: linear-gradient(145deg, var(--primary), var(--secondary));
+      display: grid;
+      place-items: center;
+      color: #fff;
+      font-size: 18px;
+      font-weight: 900;
+      letter-spacing: 0.06em;
+      box-shadow: var(--shadow);
+    }
+
+    .brand-subtitle {
+      color: var(--quiet);
+      font-size: 14px;
+    }
+
+    .theme-toggle {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 10px 16px;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+      backdrop-filter: blur(10px);
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 24px;
+      align-items: stretch;
+      margin-bottom: 28px;
+    }
+
+    .hero-card,
+    .panel {
+      background: var(--surface);
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      box-shadow: var(--shadow);
+      border-radius: var(--radius-lg);
+      backdrop-filter: blur(12px);
+    }
+
+    .hero-copy {
+      padding: 34px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 360px;
+    }
+
+    .eyebrow,
+    .theme-pill,
+    .status-chip,
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      width: fit-content;
+    }
+
+    .eyebrow {
+      padding: 8px 12px;
+      background: var(--hero-chip);
+      color: var(--primary);
+      font-size: 14px;
+    }
+
+    .theme-pill {
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.55);
+      border: 1px solid var(--line);
+      color: var(--quiet);
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0;
+      font-family: var(--font-heading);
+    }
+
+    h1 {
+      margin: 16px 0 12px;
+      font-size: clamp(42px, 5vw, 60px);
+      line-height: 1.08;
+      letter-spacing: -0.02em;
+      font-weight: 900;
+    }
+
+    .hero p,
+    .section-header p,
+    .muted,
+    .footer-note {
+      color: var(--quiet);
+    }
+
+    .hero p {
+      margin: 0;
+      font-size: 18px;
+      max-width: 48ch;
+    }
+
+    .cta-row {
+      display: flex;
+      gap: 12px;
+      margin-top: 24px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      border: none;
+      border-radius: 999px;
+      padding: 13px 18px;
+      font: inherit;
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    .btn-primary {
+      background: var(--primary);
+      color: #fff;
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.52);
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+
+    .hero-stage {
+      padding: 20px;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 14px;
+    }
+
+    .stage-window,
+    .app-mock {
+      background: var(--surface-strong);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      overflow: hidden;
+      box-shadow: var(--shadow);
+    }
+
+    .stage-window {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 320px;
+    }
+
+    .stage-head,
+    .mock-header {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.55), transparent);
+    }
+
+    .status-chip {
+      padding: 8px 10px;
+      background: rgba(46, 122, 215, 0.12);
+      color: var(--accent);
+    }
+
+    .hero-grid,
+    .spec-grid,
+    .palette-grid {
+      display: grid;
+      gap: 16px;
+    }
+
+    .hero-grid {
+      grid-template-columns: 1.15fr 0.85fr;
+      padding: 16px;
+      gap: 12px;
+    }
+
+    .hero-tile,
+    .mini-card,
+    .tile,
+    .spec-sample {
+      border-radius: var(--radius-md);
+      border: 1px solid var(--hero-border);
+    }
+
+    .hero-tile {
+      background: var(--hero-gradient);
+      padding: 18px;
+    }
+
+    .hero-tile h3,
+    .section h2 {
+      margin-bottom: 8px;
+      font-size: 22px;
+    }
+
+    .mini-stack,
+    .section,
+    .swatch,
+    .mock-grid,
+    .radar-list,
+    .import-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .mini-card,
+    .tile,
+    .spec-sample {
+      background: rgba(255, 255, 255, 0.46);
+      padding: 16px;
+    }
+
+    .section {
+      margin-top: 24px;
+      gap: 16px;
+    }
+
+    .section-header {
+      align-items: end;
+    }
+
+    .section-header p {
+      margin: 0;
+      max-width: 54ch;
+    }
+
+    .spec-grid,
+    .palette-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .panel {
+      padding: 20px;
+    }
+
+    .display-sample {
+      font-family: var(--font-heading);
+      font-size: 36px;
+      line-height: 1.2;
+      font-weight: 900;
+    }
+
+    .body-sample {
+      font-size: 16px;
+    }
+
+    .mono-sample,
+    .metric {
+      font-family: var(--font-mono);
+    }
+
+    .mono-sample {
+      font-size: 14px;
+    }
+
+    .swatch-color {
+      height: 92px;
+      border-radius: 18px;
+      border: 1px solid rgba(0, 0, 0, 0.04);
+    }
+
+    .swatch small {
+      color: var(--quiet);
+    }
+
+    .mock-grid {
+      grid-template-columns: 1fr;
+      gap: 18px;
+    }
+
+    .student-layout {
+      padding: 18px;
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 14px;
+    }
+
+    .teacher-layout {
+      padding: 18px;
+      display: grid;
+      grid-template-columns: 0.85fr 1.25fr 0.75fr;
+      gap: 14px;
+    }
+
+    .admin-layout {
+      padding: 18px;
+      display: grid;
+      grid-template-columns: 0.9fr 1.1fr;
+      gap: 14px;
+    }
+
+    .tile {
+      min-height: 120px;
+      border-color: var(--line);
+    }
+
+    .tile strong {
+      display: block;
+      margin-bottom: 8px;
+    }
+
+    .metric {
+      font-size: 28px;
+      font-weight: 600;
+      margin-top: 8px;
+    }
+
+    .radar-row,
+    .import-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.52);
+      border: 1px solid var(--line);
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      display: inline-block;
+      margin-right: 8px;
+    }
+
+    .table {
+      margin-top: 10px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      overflow: hidden;
+    }
+
+    .table-row {
+      display: grid;
+      grid-template-columns: 1fr 120px 120px;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      font-size: 14px;
+      align-items: center;
+    }
+
+    .table-row:last-child {
+      border-bottom: none;
+    }
+
+    .tag {
+      padding: 6px 10px;
+    }
+
+    .tag-ok {
+      background: rgba(47, 158, 111, 0.12);
+      color: var(--success);
+    }
+
+    .tag-warn {
+      background: rgba(217, 138, 31, 0.12);
+      color: var(--warning);
+    }
+
+    .tag-err {
+      background: rgba(200, 75, 71, 0.12);
+      color: var(--error);
+    }
+
+    .footer-note {
+      margin-top: 24px;
+      padding: 18px 20px;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.45);
+      border: 1px solid var(--line);
+    }
+
+    @media (max-width: 1100px) {
+      .hero,
+      .student-layout,
+      .teacher-layout,
+      .admin-layout,
+      .hero-grid,
+      .spec-grid,
+      .palette-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 768px) {
+      .shell {
+        padding: 18px 14px 48px;
+      }
+
+      .hero-copy {
+        padding: 24px;
+        min-height: auto;
+      }
+
+      h1 {
+        font-size: 42px;
+      }
+
+      .topbar,
+      .section-header,
+      .mock-header {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+
+      .table-row {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topbar">
+      <div class="brand">
+        <div class="brand-badge">2+</div>
+        <div>
+          <div style="font-weight: 900;">LearnSite 2+</div>
+          <div class="brand-subtitle">Design System Preview · <span id="themeName">Classroom Workshop</span></div>
+        </div>
+      </div>
+      <button class="theme-toggle" id="themeToggle">切换主题风格：Classroom Workshop</button>
+    </div>
+
+    <section class="hero">
+      <div class="hero-card hero-copy">
+        <div>
+          <div class="eyebrow">信息科技学生学习综合门户</div>
+          <h1>让学生知道现在该做什么，让教师一眼看见整堂课。</h1>
+          <p>
+            这套视觉系统不是把旧 ASPX 门户简单“翻新”，而是围绕课堂工作流重新组织的多学校平台。
+            学生端像任务舞台，教师端像课堂驾驶舱，后台像迁移与治理控制台。
+          </p>
+          <div class="cta-row">
+            <button class="btn btn-primary">进入学生登录</button>
+            <button class="btn btn-secondary">查看教师控制台</button>
+          </div>
+        </div>
+        <div class="cta-row" style="margin-top: 20px;">
+          <span class="theme-pill">当前风格：<span id="themeSummary">暖纸面、课堂感、任务舞台</span></span>
+        </div>
+      </div>
+      <div class="hero-card hero-stage">
+        <div class="stage-window">
+          <div class="stage-head">
+            <div>
+              <strong>学生首页 · 当前课堂</strong>
+              <div class="muted" style="font-size: 13px;">八年级下 · 第 3 课 · 人工智能技术基础</div>
+            </div>
+            <div class="status-chip">进行中 · 27 分钟</div>
+          </div>
+          <div class="hero-grid">
+            <div class="hero-tile">
+              <div class="muted">当前任务</div>
+              <h3 style="font-size: 30px; margin-top: 6px; font-weight: 900;">完成 Python 数据采集小实验</h3>
+              <p class="muted">先阅读导学，再上传图表作品。老师已开启课堂实时雷达与在线帮助。</p>
+            </div>
+            <div class="mini-stack">
+              <div class="mini-card">
+                <strong>今日待办</strong>
+                <div class="muted">提交作品 · 1 项未完成</div>
+              </div>
+              <div class="mini-card">
+                <strong>我的进度</strong>
+                <div class="metric" style="color: var(--primary);">72%</div>
+              </div>
+              <div class="mini-card">
+                <strong>作品状态</strong>
+                <div class="muted">草稿已保存，等待正式提交</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header">
+        <div>
+          <h2>Typography</h2>
+          <p>
+            整站默认不用特殊装饰字体。标题、正文、UI 标签统一使用稳定的
+            <strong>Noto Sans SC</strong>，数字与代码强调使用 <strong>IBM Plex Mono</strong>。
+          </p>
+        </div>
+      </div>
+      <div class="spec-grid">
+        <div class="panel">
+          <strong>Heading / Hero · Noto Sans SC</strong>
+          <div class="spec-sample display-sample">课堂、任务、成长，一眼能看懂</div>
+        </div>
+        <div class="panel">
+          <strong>Body / UI · Noto Sans SC</strong>
+          <div class="spec-sample body-sample">
+            当前课堂、今日任务、批次预检、错误明细、回滚操作。统一字体系统保证学生端有亲和力，
+            教师端和后台端也保持清晰、稳定、易实现。
+          </div>
+        </div>
+        <div class="panel">
+          <strong>Numeric / Code · IBM Plex Mono</strong>
+          <div class="spec-sample mono-sample">BATCH-20260325-001<br />ATTN 048 / 049<br />LATENCY 082ms</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header">
+        <div>
+          <h2>Theme Styles</h2>
+          <p>
+            这里的主题切换不是亮色 / 暗色，而是不同视觉风格家族。它们共享同一套信息架构与交互语义，
+            但呈现出不同校园气质。
+          </p>
+        </div>
+      </div>
+      <div class="palette-grid">
+        <div class="panel swatch">
+          <div class="swatch-color" style="background: linear-gradient(135deg, #1565c0, #26a69a);"></div>
+          <strong>Material Design</strong>
+          <small>结构清晰、层次明确、现代规范</small>
+        </div>
+        <div class="panel swatch">
+          <div class="swatch-color" style="background: linear-gradient(135deg, #506b2d, #c48b3a);"></div>
+          <strong>Natural</strong>
+          <small>自然与有机风格，大地色、植物感、温暖环保</small>
+        </div>
+        <div class="panel swatch">
+          <div class="swatch-color" style="background: linear-gradient(135deg, #1f6a5a, #f29a2e);"></div>
+          <strong>Classroom Workshop</strong>
+          <small>暖纸面、课堂工作台、当前默认推荐风格</small>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header">
+        <div>
+          <h2>Mockup 1 · Student Dashboard</h2>
+          <p>学生看到的不是门户目录，而是“这节课我现在该做什么”。</p>
+        </div>
+      </div>
+      <div class="app-mock">
+        <div class="mock-header">
+          <div>
+            <strong>当前课堂</strong>
+            <div class="muted">第 3 课 · 人工智能技术基础</div>
+          </div>
+          <span class="tag tag-ok">已进入课堂</span>
+        </div>
+        <div class="student-layout">
+          <div class="tile">
+            <strong>当前任务</strong>
+            <div style="font-size: 26px; margin: 8px 0 10px; font-weight: 900;">完成数据采集并提交图表作品</div>
+            <div class="muted">先看导学，再做实验，最后上传作品。教师会在课堂雷达中实时看到你的进度。</div>
+          </div>
+          <div class="tile">
+            <strong>我的进度</strong>
+            <div class="metric">3 / 4</div>
+            <div class="muted">已完成步骤：导学、实验、草稿保存</div>
+          </div>
+          <div class="tile">
+            <strong>今日待办</strong>
+            <div class="import-list">
+              <div class="import-row"><span>正式提交作品</span><span class="tag tag-warn">待完成</span></div>
+              <div class="import-row"><span>查看教师反馈</span><span class="tag tag-ok">可查看</span></div>
+            </div>
+          </div>
+          <div class="tile">
+            <strong>我的作品状态</strong>
+            <div class="muted">草稿已保存于 14:24，可继续编辑。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header">
+        <div>
+          <h2>Mockup 2 · Teacher Classroom Console</h2>
+          <p>教师端像课堂驾驶舱，实时雷达在左，课堂工作区在中，AI 副驾在右。</p>
+        </div>
+      </div>
+      <div class="app-mock">
+        <div class="mock-header">
+          <div>
+            <strong>八年级 1 班 · 当前课次进行中</strong>
+            <div class="muted">第 3 课 · 人工智能技术基础 · 49 人</div>
+          </div>
+          <span class="tag tag-ok">课堂已开始</span>
+        </div>
+        <div class="teacher-layout">
+          <div class="tile">
+            <strong>课堂实时雷达</strong>
+            <div class="radar-list">
+              <div class="radar-row"><span><span class="dot" style="background: var(--warning);"></span>未签到</span><strong>2</strong></div>
+              <div class="radar-row"><span><span class="dot" style="background: var(--error);"></span>未进入任务</span><strong>4</strong></div>
+              <div class="radar-row"><span><span class="dot" style="background: var(--progress);"></span>长时间停留</span><strong>3</strong></div>
+              <div class="radar-row"><span><span class="dot" style="background: var(--accent);"></span>举手求助</span><strong>1</strong></div>
+            </div>
+          </div>
+          <div class="tile">
+            <strong>当前课堂工作区</strong>
+            <div class="import-list">
+              <div class="import-row"><span>步骤 1 导学说明</span><span class="tag tag-ok">完成</span></div>
+              <div class="import-row"><span>步骤 2 数据采集</span><span class="tag tag-warn">进行中</span></div>
+              <div class="import-row"><span>步骤 3 作品提交</span><span class="tag tag-err">待提醒</span></div>
+            </div>
+          </div>
+          <div class="tile">
+            <strong>教师 AI 副驾</strong>
+            <div class="muted">
+              已生成 3 条活动建议、2 份差异化草稿、2 份反馈草稿。所有内容都以草稿状态呈现，
+              需教师确认后才能使用。
+            </div>
+            <div class="cta-row" style="margin-top: 14px;">
+              <button class="btn btn-primary">查看草稿</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header">
+        <div>
+          <h2>Mockup 3 · Admin Migration Center</h2>
+          <p>后台优先显示上下文，再显示风险，再给出操作，避免管理员在迁移动作里迷路。</p>
+        </div>
+      </div>
+      <div class="app-mock">
+        <div class="mock-header">
+          <div>
+            <strong>迁移兼容中心</strong>
+            <div class="muted">实验学校 A · 2025-2026 学年第二学期</div>
+          </div>
+          <span class="tag tag-warn">批次预检中</span>
+        </div>
+        <div class="admin-layout">
+          <div class="tile">
+            <strong>批次状态</strong>
+            <div class="import-list">
+              <div class="import-row"><span>上传文件</span><span class="tag tag-ok">已完成</span></div>
+              <div class="import-row"><span>字段预检</span><span class="tag tag-warn">进行中</span></div>
+              <div class="import-row"><span>执行导入</span><span class="tag tag-err">未开始</span></div>
+            </div>
+          </div>
+          <div class="tile">
+            <strong>差异预览</strong>
+            <div class="table">
+              <div class="table-row"><strong>字段</strong><strong>旧值</strong><strong>新值</strong></div>
+              <div class="table-row"><span>班级</span><span class="muted">8.1</span><span>8.2</span></div>
+              <div class="table-row"><span>学号映射</span><span class="muted">240101</span><span>legacy-001</span></div>
+              <div class="table-row"><span>错误行</span><span class="muted">0</span><span class="tag tag-ok">通过</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="footer-note">
+      设计结论：默认字体系统统一为 Noto Sans SC，不再依赖特殊装饰字体。
+      主题切换改为不同视觉风格家族，当前预览支持 Classroom Workshop、Material Design、Natural 三种方向。
+    </div>
+  </div>
+
+  <script>
+    const root = document.documentElement;
+    const toggle = document.getElementById("themeToggle");
+    const themeName = document.getElementById("themeName");
+    const themeSummary = document.getElementById("themeSummary");
+    const themes = [
+      { id: "workshop", name: "Classroom Workshop", summary: "暖纸面、课堂感、任务舞台" },
+      { id: "material", name: "Material Design", summary: "结构清晰、层次明确、现代规范" },
+      { id: "natural", name: "Natural", summary: "大地色、有机感、自然温暖" }
+    ];
+    let index = 0;
+
+    function applyTheme() {
+      const current = themes[index];
+      root.setAttribute("data-style", current.id);
+      themeName.textContent = current.name;
+      themeSummary.textContent = current.summary;
+      toggle.textContent = `切换主题风格：${current.name}`;
+    }
+
+    toggle.addEventListener("click", () => {
+      index = (index + 1) % themes.length;
+      applyTheme();
+    });
+
+    applyTheme();
+  </script>
+</body>
+</html>
