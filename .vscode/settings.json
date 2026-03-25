@@ -1,20 +1,38 @@
 {
-    "MicroPython.executeButton": [
-        {
-            "text": "▶",
-            "tooltip": "运行",
-            "alignment": "left",
-            "command": "extension.executeFile",
-            "priority": 3.5
-        }
-    ],
-    "MicroPython.syncButton": [
-        {
-            "text": "$(sync)",
-            "tooltip": "同步",
-            "alignment": "left",
-            "command": "extension.execute",
-            "priority": 4
-        }
-    ]
+  "files.encoding": "utf8",
+  "files.autoGuessEncoding": false,
+  "files.insertFinalNewline": true,
+  "terminal.integrated.defaultProfile.windows": "PowerShell UTF-8",
+  "terminal.integrated.profiles.windows": {
+    "PowerShell UTF-8": {
+      "source": "PowerShell",
+      "args": [
+        "-NoExit",
+        "-Command",
+        "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); chcp 65001 > $null"
+      ]
+    }
+  },
+  "terminal.integrated.env.windows": {
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8"
+  },
+  "MicroPython.executeButton": [
+    {
+      "text": "$(play)",
+      "tooltip": "运行",
+      "alignment": "left",
+      "command": "extension.executeFile",
+      "priority": 3.5
+    }
+  ],
+  "MicroPython.syncButton": [
+    {
+      "text": "$(sync)",
+      "tooltip": "同步",
+      "alignment": "left",
+      "command": "extension.execute",
+      "priority": 4
+    }
+  ]
 }

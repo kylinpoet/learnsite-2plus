@@ -5,4 +5,6 @@ backend/alembic/__pycache__/
 backend/app/__pycache__/
 backend/learnsite.db
 backend/*.db
+backend/.env
+frontend/.env
 *.pyc

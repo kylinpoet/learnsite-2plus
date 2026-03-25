@@ -59,6 +59,17 @@ class SubmissionStatus(str, Enum):
     REVIEWED = "reviewed"
 
 
+class ReviewDecision(str, Enum):
+    APPROVED = "approved"
+    REVISION_REQUESTED = "revision_requested"
+    REJECTED = "rejected"
+
+
+class SubmissionRevisionAction(str, Enum):
+    DRAFT_SAVED = "draft_saved"
+    SUBMITTED = "submitted"
+
+
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -183,7 +194,44 @@ class Submission(Base, TimestampMixin):
     draft_saved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     teacher_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    review_decision: Mapped[ReviewDecision | None] = mapped_column(SqlEnum(ReviewDecision), nullable=True)
+    reviewed_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    revisions: Mapped[list["SubmissionRevision"]] = relationship(back_populates="submission")
+    reviews: Mapped[list["SubmissionReview"]] = relationship(back_populates="submission")
+
+
+class SubmissionRevision(Base):
+    __tablename__ = "submission_revisions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), index=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("class_sessions.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(128))
+    content: Mapped[str] = mapped_column(Text)
+    action: Mapped[SubmissionRevisionAction] = mapped_column(SqlEnum(SubmissionRevisionAction))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    submission: Mapped[Submission] = relationship(back_populates="revisions")
+
+
+class SubmissionReview(Base, TimestampMixin):
+    __tablename__ = "submission_reviews"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), index=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("class_sessions.id"), index=True)
+    reviewer_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    decision: Mapped[ReviewDecision] = mapped_column(SqlEnum(ReviewDecision))
+    feedback: Mapped[str] = mapped_column(Text)
+    ai_draft_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    submission: Mapped[Submission] = relationship(back_populates="reviews")
 
 
 class HelpRequest(Base, TimestampMixin):
@@ -221,6 +269,10 @@ class MigrationPreviewItem(Base):
     legacy_value: Mapped[str] = mapped_column(String(128))
     new_value: Mapped[str] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(32))
+    issue_detail: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    resolution_note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    resolved_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     batch: Mapped[MigrationBatch] = relationship(back_populates="preview_rows")
 

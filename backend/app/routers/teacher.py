@@ -18,9 +18,14 @@ from ..models import (
     ClassSession,
     Classroom,
     Course,
+    HelpRequest,
     PresenceState,
     PresenceStatus,
+    ReviewDecision,
     Submission,
+    SubmissionRevision,
+    SubmissionRevisionAction,
+    SubmissionReview,
     SubmissionStatus,
     User,
     UserRole,
@@ -33,16 +38,49 @@ from ..schemas import (
     MessageResponse,
     RadarSummary,
     StartSessionRequest,
+    SubmissionHistoryEntry,
     SubmissionQueueItem,
+    SubmissionReviewRequest,
+    SubmissionReviewSummary,
     TeacherConsoleResponse,
     TeacherDraft,
+    TeacherHelpRequestSummary,
     TeacherLaunchOption,
+    TeacherSubmissionDetail,
     TodoItem,
 )
 
 router = APIRouter(prefix="/teacher", tags=["teacher"])
 
 ALLOWED_ROLES = (UserRole.TEACHER, UserRole.SCHOOL_ADMIN, UserRole.PLATFORM_ADMIN)
+
+
+def _format_hm(value: datetime | None) -> str | None:
+    return value.strftime("%H:%M") if value else None
+
+
+def _format_hms(value: datetime | None) -> str | None:
+    return value.strftime("%H:%M:%S") if value else None
+
+
+def _format_full(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M")
+
+
+def _shorten(text: str, *, limit: int = 96) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: limit - 1]}…"
+
+
+def _decision_label(decision: ReviewDecision) -> str:
+    labels = {
+        ReviewDecision.APPROVED: "已通过",
+        ReviewDecision.REVISION_REQUESTED: "需要修改后重交",
+        ReviewDecision.REJECTED: "暂不通过",
+    }
+    return labels[decision]
 
 
 def _resolve_operator(db: Session, principal: Principal) -> User:
@@ -82,6 +120,22 @@ def _get_current_session(db: Session, principal: Principal, operator: User) -> t
     return session_obj, course, classroom
 
 
+def _get_submission(
+    db: Session,
+    principal: Principal,
+    submission_id: int,
+) -> Submission:
+    submission = db.scalar(
+        select(Submission).where(
+            Submission.id == submission_id,
+            Submission.school_id == principal.school_id,
+        )
+    )
+    if submission is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Submission not found.")
+    return submission
+
+
 def _build_radar_summary(db: Session, session_obj: ClassSession) -> RadarSummary:
     rows = db.scalars(select(PresenceState).where(PresenceState.session_id == session_obj.id)).all()
     now = datetime.utcnow()
@@ -118,7 +172,7 @@ def _serialize_draft(draft: AISuggestionDraft) -> TeacherDraft:
         draft_type=draft.draft_type,
         title=draft.title,
         content=draft.content,
-        created_at=draft.created_at.strftime("%Y-%m-%d %H:%M"),
+        created_at=_format_full(draft.created_at),
         status=draft.status,
     )
 
@@ -160,9 +214,33 @@ def _serialize_attendance(db: Session, session_obj: ClassSession) -> list[Attend
                 student_name=student.display_name,
                 student_username=student.username,
                 status=record.status,
-                marked_at=record.marked_at.strftime("%H:%M") if record.marked_at else None,
+                marked_at=_format_hm(record.marked_at),
                 note=record.note,
-                last_seen_at=presence.last_seen_at.strftime("%H:%M:%S") if presence else None,
+                last_seen_at=_format_hms(presence.last_seen_at) if presence else None,
+            )
+        )
+    return results
+
+
+def _serialize_help_requests(db: Session, session_obj: ClassSession) -> list[TeacherHelpRequestSummary]:
+    help_requests = db.scalars(
+        select(HelpRequest)
+        .where(HelpRequest.session_id == session_obj.id)
+        .order_by(HelpRequest.status.asc(), HelpRequest.created_at.desc())
+    ).all()
+    results: list[TeacherHelpRequestSummary] = []
+    for request in help_requests:
+        student = db.get(User, request.user_id)
+        if student is None:
+            continue
+        results.append(
+            TeacherHelpRequestSummary(
+                id=request.id,
+                student_name=student.display_name,
+                student_username=student.username,
+                message=request.message,
+                created_at=_format_full(request.created_at),
+                status=request.status,
             )
         )
     return results
@@ -172,9 +250,13 @@ def _serialize_submissions(db: Session, session_obj: ClassSession) -> list[Submi
     submissions = db.scalars(
         select(Submission).where(Submission.session_id == session_obj.id).order_by(Submission.updated_at.desc())
     ).all()
+    presence_rows = db.scalars(select(PresenceState).where(PresenceState.session_id == session_obj.id)).all()
+    presence_map = {row.user_id: row for row in presence_rows}
+
     results: list[SubmissionQueueItem] = []
     for submission in submissions:
         student = db.get(User, submission.user_id)
+        presence = presence_map.get(submission.user_id)
         if student is None:
             continue
         results.append(
@@ -185,11 +267,137 @@ def _serialize_submissions(db: Session, session_obj: ClassSession) -> list[Submi
                 title=submission.title,
                 status=submission.status,
                 version=submission.version,
-                draft_saved_at=submission.draft_saved_at.strftime("%H:%M") if submission.draft_saved_at else None,
-                submitted_at=submission.submitted_at.strftime("%H:%M") if submission.submitted_at else None,
+                draft_saved_at=_format_hm(submission.draft_saved_at),
+                submitted_at=_format_hm(submission.submitted_at),
+                help_requested=presence.help_requested if presence else False,
+                review_decision=submission.review_decision,
+                reviewed_at=_format_hm(submission.reviewed_at),
             )
         )
     return results
+
+
+def _build_submission_history(db: Session, submission: Submission) -> list[SubmissionHistoryEntry]:
+    student = db.get(User, submission.user_id)
+    student_name = student.display_name if student else "学生"
+    rows: list[tuple[datetime, SubmissionHistoryEntry]] = []
+
+    revisions = db.scalars(
+        select(SubmissionRevision)
+        .where(SubmissionRevision.submission_id == submission.id)
+        .order_by(SubmissionRevision.created_at.desc(), SubmissionRevision.id.desc())
+    ).all()
+    for revision in revisions:
+        if revision.action == SubmissionRevisionAction.SUBMITTED:
+            summary = f"正式提交了第 v{revision.version} 版作品"
+            entry_type = "submitted"
+        else:
+            summary = f"保存了第 v{revision.version} 版草稿"
+            entry_type = "draft_saved"
+        rows.append(
+            (
+                revision.created_at,
+                SubmissionHistoryEntry(
+                    id=revision.id,
+                    entry_type=entry_type,
+                    summary=summary,
+                    actor_name=student_name,
+                    occurred_at=_format_full(revision.created_at),
+                    version=revision.version,
+                ),
+            )
+        )
+
+    reviews = db.scalars(
+        select(SubmissionReview)
+        .where(SubmissionReview.submission_id == submission.id)
+        .order_by(SubmissionReview.created_at.desc(), SubmissionReview.id.desc())
+    ).all()
+    for review in reviews:
+        reviewer = db.get(User, review.reviewer_user_id)
+        reviewer_name = reviewer.display_name if reviewer else "教师"
+        rows.append(
+            (
+                review.created_at,
+                SubmissionHistoryEntry(
+                    id=review.id,
+                    entry_type="reviewed",
+                    summary=_shorten(review.feedback),
+                    actor_name=reviewer_name,
+                    occurred_at=_format_full(review.created_at),
+                    decision=review.decision,
+                ),
+            )
+        )
+
+    rows.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in rows]
+
+
+def _serialize_review(db: Session, review: SubmissionReview) -> SubmissionReviewSummary:
+    reviewer = db.get(User, review.reviewer_user_id)
+    return SubmissionReviewSummary(
+        id=review.id,
+        reviewer_name=reviewer.display_name if reviewer else "教师",
+        decision=review.decision,
+        feedback=review.feedback,
+        created_at=_format_full(review.created_at),
+    )
+
+
+def _serialize_submission_detail(db: Session, submission: Submission) -> TeacherSubmissionDetail:
+    student = db.get(User, submission.user_id)
+    if student is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found.")
+
+    presence = db.scalar(
+        select(PresenceState).where(
+            PresenceState.session_id == submission.session_id,
+            PresenceState.user_id == submission.user_id,
+        )
+    )
+    help_messages = db.scalars(
+        select(HelpRequest)
+        .where(
+            HelpRequest.session_id == submission.session_id,
+            HelpRequest.user_id == submission.user_id,
+        )
+        .order_by(HelpRequest.created_at.desc())
+    ).all()
+    reviews = db.scalars(
+        select(SubmissionReview)
+        .where(SubmissionReview.submission_id == submission.id)
+        .order_by(SubmissionReview.created_at.desc(), SubmissionReview.id.desc())
+    ).all()
+
+    return TeacherSubmissionDetail(
+        id=submission.id,
+        student_name=student.display_name,
+        student_username=student.username,
+        title=submission.title,
+        content=submission.content,
+        status=submission.status,
+        version=submission.version,
+        draft_saved_at=_format_hm(submission.draft_saved_at),
+        submitted_at=_format_hm(submission.submitted_at),
+        teacher_feedback=submission.teacher_feedback,
+        review_decision=submission.review_decision,
+        reviewed_at=_format_hm(submission.reviewed_at),
+        help_requested=presence.help_requested if presence else False,
+        help_messages=[
+            TeacherHelpRequestSummary(
+                id=item.id,
+                student_name=student.display_name,
+                student_username=student.username,
+                message=item.message,
+                created_at=_format_full(item.created_at),
+                status=item.status,
+            )
+            for item in help_messages
+        ],
+        history=_build_submission_history(db, submission),
+        reviews=[_serialize_review(db, review) for review in reviews],
+    )
 
 
 def _build_console_response(db: Session, principal: Principal, operator: User) -> TeacherConsoleResponse:
@@ -201,16 +409,26 @@ def _build_console_response(db: Session, principal: Principal, operator: User) -
     ).all()
 
     submission_items = _serialize_submissions(db, session_obj)
-    submitted_count = sum(item.status != SubmissionStatus.DRAFT for item in submission_items)
+    help_requests = _serialize_help_requests(db, session_obj)
+    review_ready_count = sum(item.status != SubmissionStatus.DRAFT for item in submission_items)
     workbench_steps = [
-        TodoItem(title="步骤 1 · 开课并确认课堂上下文", status="done" if session_obj.status == "active" else "pending"),
+        TodoItem(title="开课并确认课堂上下文", status="done" if session_obj.status == "active" else "pending"),
         TodoItem(
-            title="步骤 2 · 完成签到与到课确认",
-            status="done" if all(record.status != AttendanceStatus.PENDING for record in db.scalars(select(AttendanceRecord).where(AttendanceRecord.session_id == session_obj.id)).all()) else "active",
+            title="完成签到与在线状态核验",
+            status=(
+                "done"
+                if all(
+                    record.status != AttendanceStatus.PENDING
+                    for record in db.scalars(
+                        select(AttendanceRecord).where(AttendanceRecord.session_id == session_obj.id)
+                    ).all()
+                )
+                else "active"
+            ),
         ),
         TodoItem(
-            title=f"步骤 3 · 收集作品提交（已收 {submitted_count} 份）",
-            status="active" if submitted_count < session_obj.expected_students else "done",
+            title=f"处理提交与批改任务（当前 {review_ready_count} 份）",
+            status="done" if review_ready_count >= session_obj.expected_students and review_ready_count > 0 else "active",
         ),
     ]
 
@@ -226,9 +444,31 @@ def _build_console_response(db: Session, principal: Principal, operator: User) -
         workbench_steps=workbench_steps,
         launch_options=_list_launch_options(db, principal.school_id),
         attendance_records=_serialize_attendance(db, session_obj),
+        help_requests=help_requests,
         submissions=submission_items,
         ai_drafts=[_serialize_draft(draft) for draft in drafts],
     )
+
+
+def _resolve_help_requests(db: Session, submission: Submission) -> None:
+    help_requests = db.scalars(
+        select(HelpRequest).where(
+            HelpRequest.session_id == submission.session_id,
+            HelpRequest.user_id == submission.user_id,
+            HelpRequest.status == "open",
+        )
+    ).all()
+    for request in help_requests:
+        request.status = "closed"
+
+    presence = db.scalar(
+        select(PresenceState).where(
+            PresenceState.session_id == submission.session_id,
+            PresenceState.user_id == submission.user_id,
+        )
+    )
+    if presence is not None:
+        presence.help_requested = False
 
 
 @router.get("/console", response_model=TeacherConsoleResponse)
@@ -238,6 +478,98 @@ def teacher_console(
 ) -> TeacherConsoleResponse:
     operator = _resolve_operator(db, principal)
     return _build_console_response(db, principal, operator)
+
+
+@router.get("/submissions/{submission_id}", response_model=TeacherSubmissionDetail)
+def teacher_submission_detail(
+    submission_id: int,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherSubmissionDetail:
+    _resolve_operator(db, principal)
+    submission = _get_submission(db, principal, submission_id)
+    return _serialize_submission_detail(db, submission)
+
+
+@router.post("/submissions/{submission_id}/review", response_model=TeacherSubmissionDetail)
+def review_submission(
+    submission_id: int,
+    payload: SubmissionReviewRequest,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherSubmissionDetail:
+    operator = _resolve_operator(db, principal)
+    submission = _get_submission(db, principal, submission_id)
+    if submission.status == SubmissionStatus.DRAFT:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft submission cannot be reviewed yet.")
+
+    now = datetime.utcnow()
+    submission.status = SubmissionStatus.REVIEWED
+    submission.teacher_feedback = payload.feedback
+    submission.review_decision = payload.decision
+    submission.reviewed_at = now
+    submission.reviewed_by_user_id = operator.id
+    db.add(
+        SubmissionReview(
+            submission_id=submission.id,
+            school_id=submission.school_id,
+            session_id=submission.session_id,
+            reviewer_user_id=operator.id,
+            decision=payload.decision,
+            feedback=payload.feedback,
+        )
+    )
+    if payload.resolve_help_requests:
+        _resolve_help_requests(db, submission)
+
+    db.commit()
+    db.refresh(submission)
+    return _serialize_submission_detail(db, submission)
+
+
+@router.post("/submissions/{submission_id}/feedback-draft", response_model=CreateDraftResponse)
+def create_feedback_draft(
+    submission_id: int,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> CreateDraftResponse:
+    operator = _resolve_operator(db, principal)
+    submission = _get_submission(db, principal, submission_id)
+    if submission.status == SubmissionStatus.DRAFT:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft submission cannot generate feedback.")
+
+    student = db.get(User, submission.user_id)
+    if student is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found.")
+
+    latest_help = db.scalar(
+        select(HelpRequest)
+        .where(
+            HelpRequest.session_id == submission.session_id,
+            HelpRequest.user_id == submission.user_id,
+        )
+        .order_by(HelpRequest.created_at.desc())
+    )
+    help_hint = f"学生求助：{latest_help.message}" if latest_help else "当前没有新的求助记录。"
+    draft_content = (
+        f"优点：{student.display_name} 已经完成《{submission.title}》的主体表达，内容结构基本完整。\n"
+        f"建议：重点补强图表结论的依据，并把“为什么得出这个判断”写得更具体。\n"
+        f"下一步：先补 1 条数据观察，再补 1 条课堂结论后重新提交。\n"
+        f"{help_hint}"
+    )
+    draft = AISuggestionDraft(
+        school_id=principal.school_id,
+        teacher_id=operator.id,
+        session_id=submission.session_id,
+        draft_type="作业反馈草稿",
+        title=f"{student.display_name} · {submission.title} · 批改建议",
+        content=draft_content,
+        status="draft",
+    )
+    db.add(draft)
+    db.commit()
+    db.refresh(draft)
+    return CreateDraftResponse(draft=_serialize_draft(draft))
 
 
 @router.post("/session/start", response_model=TeacherConsoleResponse)
@@ -381,11 +713,11 @@ def create_ai_draft(
         school_id=principal.school_id,
         teacher_id=operator.id,
         session_id=session_obj.id,
-        draft_type="AI 草稿",
+        draft_type="课堂建议草稿",
         title=f"{course.title} · {classroom.name} · AI 副驾建议",
         content=(
-            f"目标：{payload.goal}。建议先用 8 分钟让学生完成采集，再给 5 分钟做同伴互查，"
-            "最后用 3 分钟集中展示常见错误。此结果仍为草稿，需教师确认后使用。"
+            f"目标：{payload.goal}。建议先用 8 分钟做采集，再用 5 分钟做同伴互查，"
+            "最后用 3 分钟集中展示典型问题。此输出仍为草稿，需教师确认后再使用。"
         ),
         status="draft",
     )

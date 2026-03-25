@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { ElMessage } from 'element-plus'
-import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { apiClient } from '../../api/client'
 import type {
+  ReviewDecision,
   StudentHomeResponse,
   StudentSubmissionSummary,
   SubmissionActionResponse,
+  SubmissionHistoryEntry,
   SubmissionUpsertPayload,
 } from '../../api/types'
 import MetricCard from '../../components/common/MetricCard.vue'
@@ -26,9 +28,57 @@ const submissionForm = reactive<SubmissionUpsertPayload>({
   content: '',
 })
 
+const reviewDecisionLabelMap: Record<ReviewDecision, string> = {
+  approved: '已通过',
+  revision_requested: '需要修改后重交',
+  rejected: '暂不通过',
+}
+
 function syncSubmissionForm(submission: StudentSubmissionSummary) {
   submissionForm.title = submission.title
   submissionForm.content = submission.content
+}
+
+const latestReview = computed(() => home.value?.submission.review_decision ?? null)
+
+function submissionStatusLabel(submission: StudentSubmissionSummary) {
+  if (submission.status === 'reviewed' && submission.review_decision) {
+    return reviewDecisionLabelMap[submission.review_decision]
+  }
+  if (submission.status === 'submitted') {
+    return '已提交待批改'
+  }
+  return '草稿编辑中'
+}
+
+function reviewTagType(decision: ReviewDecision | null | undefined) {
+  if (decision === 'approved') {
+    return 'success'
+  }
+  if (decision === 'revision_requested') {
+    return 'warning'
+  }
+  if (decision === 'rejected') {
+    return 'danger'
+  }
+  return 'info'
+}
+
+function historyTagType(entry: SubmissionHistoryEntry) {
+  if (entry.entry_type === 'reviewed') {
+    return reviewTagType(entry.decision)
+  }
+  return entry.entry_type === 'submitted' ? 'success' : 'info'
+}
+
+function historyLabel(entry: SubmissionHistoryEntry) {
+  if (entry.entry_type === 'reviewed' && entry.decision) {
+    return reviewDecisionLabelMap[entry.decision]
+  }
+  if (entry.entry_type === 'submitted') {
+    return '正式提交'
+  }
+  return `草稿 v${entry.version ?? ''}`.trim()
 }
 
 async function loadHome() {
@@ -39,7 +89,7 @@ async function loadHome() {
     syncSubmissionForm(data.submission)
     error.value = ''
   } catch (requestError) {
-    error.value = '学生首页加载失败，请确认后端服务已启动。'
+    error.value = '学生首页加载失败，请确认后端服务已经启动。'
     console.error(requestError)
   } finally {
     loading.value = false
@@ -62,7 +112,7 @@ async function sendHeartbeat(announce = true) {
 async function askForHelp() {
   try {
     await apiClient.post('/student/help-requests', {
-      message: '老师，我需要帮助完成当前课堂作品。',
+      message: '老师，我需要帮助完善当前课堂作品。',
     })
     ElMessage.success('已向教师端发送求助')
     await loadHome()
@@ -87,11 +137,6 @@ async function persistSubmission(mode: 'draft' | 'submit') {
       home.value.submission = data.submission
       home.value.saved_at = data.submission.draft_saved_at ?? home.value.saved_at
       home.value.progress_percent = mode === 'submit' ? 100 : Math.max(home.value.progress_percent, 82)
-      home.value.todo_items = home.value.todo_items.map((item) =>
-        item.title.includes('正式提交')
-          ? { ...item, status: mode === 'submit' ? 'done' : item.status }
-          : item,
-      )
     }
     ElMessage.success(mode === 'draft' ? '草稿已保存' : '作品已正式提交')
     await loadHome()
@@ -120,9 +165,9 @@ onBeforeUnmount(() => {
 
 <template>
   <PortalLayout
-    role-label="学生工作区"
+    role-label="学生学习门户"
     title="当前课堂"
-    :subtitle="home?.lesson_stage ?? '围绕本节课任务组织学生视图'"
+    :subtitle="home?.lesson_stage ?? '围绕本节课任务组织你的学习进度'"
     :school-name="home?.school_name ?? sessionState?.school_name ?? '加载中...'"
     :user-name="home?.student_name ?? sessionState?.display_name ?? '学生'"
     :nav-items="navItems"
@@ -140,12 +185,14 @@ onBeforeUnmount(() => {
               <span class="status-pill">{{ home.class_name }}</span>
               <span class="status-pill">签到状态：{{ home.attendance_status }}</span>
               <span class="status-pill">
-                {{ home.submission.submitted_at ? `已提交 ${home.submission.submitted_at}` : `草稿保存于 ${home.saved_at}` }}
+                {{ home.submission.submitted_at ? `最近提交 ${home.submission.submitted_at}` : `最近保存 ${home.saved_at}` }}
               </span>
             </div>
             <div class="inline-actions">
               <el-button type="primary" @click="sendHeartbeat()">刷新课堂状态</el-button>
-              <el-button plain @click="askForHelp()">向老师举手求助</el-button>
+              <el-button plain :disabled="home.help_open" @click="askForHelp()">
+                {{ home.help_open ? '已发送求助' : '向老师举手求助' }}
+              </el-button>
             </div>
           </div>
         </div>
@@ -157,7 +204,7 @@ onBeforeUnmount(() => {
             <div v-for="item in home.todo_items" :key="item.title" class="list-row">
               <div class="list-row__main">
                 <strong>{{ item.title }}</strong>
-                <span class="muted">围绕本节课堂作品推进你的学习步骤</span>
+                <span class="muted">围绕本节课堂任务推进你的学习进度</span>
               </div>
               <el-tag :type="item.status === 'done' ? 'success' : item.status === 'active' ? 'warning' : 'info'">
                 {{ item.status }}
@@ -169,12 +216,8 @@ onBeforeUnmount(() => {
 
       <section class="metric-grid">
         <MetricCard label="学习进度" :value="`${home.progress_percent}%`" hint="课堂进度实时同步" :primary="true" />
-        <MetricCard
-          label="作品状态"
-          :value="home.submission.status === 'submitted' ? '已正式提交' : '草稿编辑中'"
-          hint="支持先保存草稿，再正式提交"
-        />
-        <MetricCard label="提交版本" :value="`v${home.submission.version}`" hint="每次保存都会产生新的草稿版本" />
+        <MetricCard label="作品状态" :value="submissionStatusLabel(home.submission)" hint="保存草稿后可再正式提交" />
+        <MetricCard label="提交版本" :value="`v${home.submission.version}`" hint="每次保存或重交都会保留历史" />
       </section>
 
       <section class="page-grid page-grid--two">
@@ -217,18 +260,58 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="surface-card" style="padding: 24px;">
-          <div class="section-kicker">Highlights</div>
-          <h2 class="section-heading">本节课重点提醒</h2>
-          <div class="detail-list">
+          <div class="section-kicker">Teacher Feedback</div>
+          <h2 class="section-heading">教师反馈</h2>
+          <div v-if="latestReview" class="stack">
+            <el-tag :type="reviewTagType(latestReview)">{{ reviewDecisionLabelMap[latestReview] }}</el-tag>
+            <div class="detail-item">
+              <div>{{ home.submission.teacher_feedback }}</div>
+            </div>
+            <div class="muted">
+              <span v-if="home.submission.reviewed_by">{{ home.submission.reviewed_by }}</span>
+              <span v-if="home.submission.reviewed_at"> · {{ home.submission.reviewed_at }}</span>
+            </div>
+            <el-alert
+              v-if="home.submission.can_edit"
+              type="warning"
+              :closable="false"
+              title="老师已经给出修改建议，你可以直接在左侧编辑后再次提交。"
+            />
+          </div>
+          <div v-else class="empty-state">
+            当前还没有新的教师反馈。<br />
+            提交后老师会在教师端批改，你可以在这里继续查看结果。
+          </div>
+
+          <div class="detail-list" style="margin-top: 18px;">
             <div v-for="highlight in home.highlights" :key="highlight" class="detail-item">
               <div>{{ highlight }}</div>
             </div>
           </div>
+        </div>
+      </section>
 
-          <div class="empty-state" style="margin-top: 18px;">
-            当前提交状态：{{ home.submission.status }}<br />
-            {{ home.submission.submitted_at ? `提交时间：${home.submission.submitted_at}` : '尚未正式提交，可继续编辑。' }}
-          </div>
+      <section class="surface-card" style="padding: 24px;">
+        <div class="section-kicker">History</div>
+        <h2 class="section-heading">提交历史</h2>
+        <el-timeline v-if="home.submission_history.length > 0">
+          <el-timeline-item
+            v-for="entry in home.submission_history"
+            :key="`${entry.entry_type}-${entry.id}`"
+            :timestamp="entry.occurred_at"
+            placement="top"
+          >
+            <div class="detail-item" style="display: grid; gap: 10px;">
+              <div class="inline-actions" style="justify-content: flex-start;">
+                <el-tag :type="historyTagType(entry)">{{ historyLabel(entry) }}</el-tag>
+                <span class="muted">{{ entry.actor_name }}</span>
+              </div>
+              <div>{{ entry.summary }}</div>
+            </div>
+          </el-timeline-item>
+        </el-timeline>
+        <div v-else class="empty-state">
+          还没有提交历史，先保存草稿或正式提交后，这里会自动记录全过程。
         </div>
       </section>
     </div>

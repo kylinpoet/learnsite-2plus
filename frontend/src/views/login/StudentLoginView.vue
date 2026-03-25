@@ -77,7 +77,7 @@ onMounted(() => {
       <div>
         <div class="section-kicker">Student Login</div>
         <h2 class="section-heading">学生进入课堂</h2>
-        <p class="muted">测试账号：`240101 / 12345`。建议先选择学校，再进入学生首页。</p>
+        <p class="muted">测试账号：实验学校 A `240101 / 12345`，未来学校 B `250201 / 12345`。建议先选择学校，再进入学生首页。</p>
       </div>
 
       <el-alert v-if="loadError" :closable="false" type="warning" :title="loadError" />

@@ -1,11 +1,11 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import type { UserRole } from '../api/types'
 import { useSession } from '../composables/useSession'
-import AdminOverviewView from '../views/admin/AdminOverviewView.vue'
-import StudentLoginView from '../views/login/StudentLoginView.vue'
-import TeacherLoginView from '../views/login/TeacherLoginView.vue'
-import StudentHomeView from '../views/student/StudentHomeView.vue'
-import TeacherConsoleView from '../views/teacher/TeacherConsoleView.vue'
+
+const StudentLoginView = () => import('../views/login/StudentLoginView.vue')
+const TeacherLoginView = () => import('../views/login/TeacherLoginView.vue')
+const StudentHomeView = () => import('../views/student/StudentHomeView.vue')
+const TeacherConsoleView = () => import('../views/teacher/TeacherConsoleView.vue')
 
 const router = createRouter({
   history: createWebHistory(),
@@ -28,11 +28,7 @@ const router = createRouter({
     },
     {
       path: '/admin/overview',
-      component: AdminOverviewView,
-      meta: {
-        requiresAuth: true,
-        roles: ['school_admin', 'platform_admin'] satisfies UserRole[],
-      },
+      redirect: '/teacher/console',
     },
   ],
 })

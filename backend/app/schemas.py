@@ -3,7 +3,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import AttendanceStatus, SubmissionStatus, ThemeStyle, UserRole
+from .models import (
+    AttendanceStatus,
+    ReviewDecision,
+    SubmissionStatus,
+    ThemeStyle,
+    UserRole,
+)
 
 
 class SchoolSummary(BaseModel):
@@ -55,6 +61,16 @@ class TodoItem(BaseModel):
     status: Literal["pending", "active", "done"]
 
 
+class SubmissionHistoryEntry(BaseModel):
+    id: int
+    entry_type: Literal["draft_saved", "submitted", "reviewed"]
+    summary: str
+    actor_name: str
+    occurred_at: str
+    version: int | None = None
+    decision: ReviewDecision | None = None
+
+
 class StudentSubmissionSummary(BaseModel):
     id: int | None = None
     title: str
@@ -63,6 +79,10 @@ class StudentSubmissionSummary(BaseModel):
     version: int = 1
     draft_saved_at: str | None = None
     submitted_at: str | None = None
+    teacher_feedback: str | None = None
+    review_decision: ReviewDecision | None = None
+    reviewed_at: str | None = None
+    reviewed_by: str | None = None
     can_edit: bool = True
 
 
@@ -83,6 +103,7 @@ class StudentHomeResponse(BaseModel):
     help_open: bool
     attendance_status: AttendanceStatus
     submission: StudentSubmissionSummary
+    submission_history: list[SubmissionHistoryEntry]
 
 
 class HeartbeatRequest(BaseModel):
@@ -140,6 +161,45 @@ class SubmissionQueueItem(BaseModel):
     version: int
     draft_saved_at: str | None = None
     submitted_at: str | None = None
+    help_requested: bool = False
+    review_decision: ReviewDecision | None = None
+    reviewed_at: str | None = None
+
+
+class TeacherHelpRequestSummary(BaseModel):
+    id: int
+    student_name: str
+    student_username: str
+    message: str
+    created_at: str
+    status: str
+
+
+class SubmissionReviewSummary(BaseModel):
+    id: int
+    reviewer_name: str
+    decision: ReviewDecision
+    feedback: str
+    created_at: str
+
+
+class TeacherSubmissionDetail(BaseModel):
+    id: int
+    student_name: str
+    student_username: str
+    title: str
+    content: str
+    status: SubmissionStatus
+    version: int
+    draft_saved_at: str | None = None
+    submitted_at: str | None = None
+    teacher_feedback: str | None = None
+    review_decision: ReviewDecision | None = None
+    reviewed_at: str | None = None
+    help_requested: bool
+    help_messages: list[TeacherHelpRequestSummary]
+    history: list[SubmissionHistoryEntry]
+    reviews: list[SubmissionReviewSummary]
 
 
 class TeacherDraft(BaseModel):
@@ -163,6 +223,7 @@ class TeacherConsoleResponse(BaseModel):
     workbench_steps: list[TodoItem]
     launch_options: list[TeacherLaunchOption]
     attendance_records: list[AttendanceRecordSummary]
+    help_requests: list[TeacherHelpRequestSummary]
     submissions: list[SubmissionQueueItem]
     ai_drafts: list[TeacherDraft]
 
@@ -185,11 +246,22 @@ class AttendanceMarkRequest(BaseModel):
     note: str | None = Field(default=None, max_length=255)
 
 
+class SubmissionReviewRequest(BaseModel):
+    decision: ReviewDecision
+    feedback: str = Field(min_length=1, max_length=2000)
+    resolve_help_requests: bool = True
+
+
 class MigrationPreviewRow(BaseModel):
+    id: int
     field_name: str
     legacy_value: str
     new_value: str
     status: str
+    issue_detail: str | None = None
+    resolution_note: str | None = None
+    resolved_at: str | None = None
+    requires_resolution: bool
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -214,15 +286,36 @@ class LegacyMappingSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class MigrationFixRequest(BaseModel):
+    new_value: str = Field(min_length=1, max_length=128)
+    resolution_note: str = Field(min_length=1, max_length=255)
+    status: Literal["mapped", "resolved"] = "resolved"
+
+
+class GovernanceSchoolSnapshot(BaseModel):
+    school: SchoolSummary
+    latest_batch_name: str | None = None
+    latest_batch_status: str | None = None
+    latest_batch_progress: int | None = None
+    current_step: str | None = None
+    unresolved_preview_count: int = 0
+    can_execute_migration: bool = False
+    can_rollback_migration: bool = False
+    is_current: bool = False
+
+
 class AdminOverviewResponse(BaseModel):
     school_name: str
     admin_name: str
     active_school_count: int
+    current_school: SchoolSummary
     managed_schools: list[SchoolSummary]
+    school_snapshots: list[GovernanceSchoolSnapshot]
     active_migration: MigrationBatchSummary
     legacy_mappings: list[LegacyMappingSummary]
     can_execute_migration: bool
     can_rollback_migration: bool
+    unresolved_preview_count: int
     guardrails: list[str]
 
 
