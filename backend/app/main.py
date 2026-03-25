@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .core.config import get_settings
 from .core.database import Base, SessionLocal, engine
+from .core.migrations import upgrade_database_schema
 from .routers.admin import router as admin_router
 from .routers.auth import public_router, router as auth_router
 from .routers.student import router as student_router
@@ -18,6 +19,7 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    upgrade_database_schema()
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
         seed_demo_data(db)
