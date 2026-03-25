@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import DateTime, Enum as SqlEnum, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Enum as SqlEnum, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .core.database import Base
@@ -43,6 +43,20 @@ class TodoStatus(str, Enum):
     PENDING = "pending"
     ACTIVE = "active"
     DONE = "done"
+
+
+class AttendanceStatus(str, Enum):
+    PENDING = "pending"
+    PRESENT = "present"
+    LATE = "late"
+    ABSENT = "absent"
+    EXCUSED = "excused"
+
+
+class SubmissionStatus(str, Enum):
+    DRAFT = "draft"
+    SUBMITTED = "submitted"
+    REVIEWED = "reviewed"
 
 
 class TimestampMixin:
@@ -104,6 +118,8 @@ class Course(Base, TimestampMixin):
     school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
     title: Mapped[str] = mapped_column(String(128))
     stage_label: Mapped[str] = mapped_column(String(64))
+    assignment_title: Mapped[str] = mapped_column(String(128))
+    assignment_prompt: Mapped[str] = mapped_column(Text)
 
 
 class ClassSession(Base, TimestampMixin):
@@ -121,6 +137,23 @@ class ClassSession(Base, TimestampMixin):
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class AttendanceRecord(Base, TimestampMixin):
+    __tablename__ = "attendance_records"
+    __table_args__ = (UniqueConstraint("session_id", "user_id", name="uq_attendance_session_user"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("class_sessions.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    status: Mapped[AttendanceStatus] = mapped_column(
+        SqlEnum(AttendanceStatus),
+        default=AttendanceStatus.PENDING,
+    )
+    note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    marked_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    marked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class PresenceState(Base, TimestampMixin):
     __tablename__ = "presence_states"
     __table_args__ = (UniqueConstraint("session_id", "user_id", name="uq_presence_session_user"),)
@@ -133,6 +166,24 @@ class PresenceState(Base, TimestampMixin):
     task_progress: Mapped[int] = mapped_column(Integer, default=0)
     help_requested: Mapped[bool] = mapped_column(default=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Submission(Base, TimestampMixin):
+    __tablename__ = "submissions"
+    __table_args__ = (UniqueConstraint("session_id", "user_id", name="uq_submission_session_user"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("class_sessions.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(128))
+    content: Mapped[str] = mapped_column(Text)
+    status: Mapped[SubmissionStatus] = mapped_column(SqlEnum(SubmissionStatus), default=SubmissionStatus.DRAFT)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    draft_saved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    teacher_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class HelpRequest(Base, TimestampMixin):
@@ -158,6 +209,7 @@ class MigrationBatch(Base, TimestampMixin):
     error_count: Mapped[int] = mapped_column(Integer, default=0)
 
     preview_rows: Mapped[list["MigrationPreviewItem"]] = relationship(back_populates="batch")
+    legacy_mappings: Mapped[list["LegacyIdMapping"]] = relationship(back_populates="batch")
 
 
 class MigrationPreviewItem(Base):
@@ -171,6 +223,20 @@ class MigrationPreviewItem(Base):
     status: Mapped[str] = mapped_column(String(32))
 
     batch: Mapped[MigrationBatch] = relationship(back_populates="preview_rows")
+
+
+class LegacyIdMapping(Base, TimestampMixin):
+    __tablename__ = "legacy_id_mappings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("migration_batches.id"), index=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
+    entity_type: Mapped[str] = mapped_column(String(64))
+    legacy_id: Mapped[str] = mapped_column(String(128))
+    new_id: Mapped[str] = mapped_column(String(128))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    batch: Mapped[MigrationBatch] = relationship(back_populates="legacy_mappings")
 
 
 class AISuggestionDraft(Base, TimestampMixin):

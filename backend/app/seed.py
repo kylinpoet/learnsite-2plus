@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 from .core.auth import hash_password
 from .models import (
     AISuggestionDraft,
+    AttendanceRecord,
+    AttendanceStatus,
     ClassSession,
     Classroom,
     Course,
@@ -18,6 +20,8 @@ from .models import (
     PresenceState,
     PresenceStatus,
     School,
+    Submission,
+    SubmissionStatus,
     ThemeStyle,
     User,
     UserRole,
@@ -46,9 +50,10 @@ def seed_demo_data(db: Session) -> None:
     db.add_all([school_a, school_b])
     db.flush()
 
-    class_a = Classroom(school_id=school_a.id, name="八年级 1 班", grade_label="八年级")
-    class_b = Classroom(school_id=school_b.id, name="七年级 2 班", grade_label="七年级")
-    db.add_all([class_a, class_b])
+    class_a1 = Classroom(school_id=school_a.id, name="八年级 1 班", grade_label="八年级")
+    class_a2 = Classroom(school_id=school_a.id, name="八年级 2 班", grade_label="八年级")
+    class_b1 = Classroom(school_id=school_b.id, name="七年级 2 班", grade_label="七年级")
+    db.add_all([class_a1, class_a2, class_b1])
     db.flush()
 
     teacher = User(
@@ -68,7 +73,7 @@ def seed_demo_data(db: Session) -> None:
     students = [
         User(
             school_id=school_a.id,
-            classroom_id=class_a.id,
+            classroom_id=class_a1.id,
             username="240101",
             display_name="李同学",
             password_hash=hash_password("12345"),
@@ -76,7 +81,7 @@ def seed_demo_data(db: Session) -> None:
         ),
         User(
             school_id=school_a.id,
-            classroom_id=class_a.id,
+            classroom_id=class_a1.id,
             username="240102",
             display_name="王同学",
             password_hash=hash_password("12345"),
@@ -84,7 +89,7 @@ def seed_demo_data(db: Session) -> None:
         ),
         User(
             school_id=school_a.id,
-            classroom_id=class_a.id,
+            classroom_id=class_a1.id,
             username="240103",
             display_name="张同学",
             password_hash=hash_password("12345"),
@@ -92,7 +97,7 @@ def seed_demo_data(db: Session) -> None:
         ),
         User(
             school_id=school_a.id,
-            classroom_id=class_a.id,
+            classroom_id=class_a1.id,
             username="240104",
             display_name="陈同学",
             password_hash=hash_password("12345"),
@@ -100,7 +105,7 @@ def seed_demo_data(db: Session) -> None:
         ),
         User(
             school_id=school_a.id,
-            classroom_id=class_a.id,
+            classroom_id=class_a1.id,
             username="240105",
             display_name="赵同学",
             password_hash=hash_password("12345"),
@@ -111,22 +116,33 @@ def seed_demo_data(db: Session) -> None:
     db.add_all([teacher, admin, *students])
     db.flush()
 
-    course = Course(
+    course_ai = Course(
         school_id=school_a.id,
         title="人工智能技术基础",
         stage_label="第 3 课 · 数据采集与图表作品",
+        assignment_title="课堂图表作品提交",
+        assignment_prompt="请根据课堂采集到的数据，整理一份图表作品，并说明你从数据中观察到的规律。",
     )
-    db.add(course)
+    course_web = Course(
+        school_id=school_a.id,
+        title="网页设计入门",
+        stage_label="第 2 课 · 信息卡片页面排版",
+        assignment_title="信息卡片页面草稿",
+        assignment_prompt="完成一个包含标题、图片区域和说明文字的信息卡片页面，并保存为课堂草稿。",
+    )
+    db.add_all([course_ai, course_web])
     db.flush()
 
     session = ClassSession(
         school_id=school_a.id,
-        classroom_id=class_a.id,
-        course_id=course.id,
+        classroom_id=class_a1.id,
+        course_id=course_ai.id,
         teacher_id=teacher.id,
-        title=course.title,
-        stage="进行中 · 数据采集与图表作品",
+        title=course_ai.title,
+        stage=course_ai.stage_label,
+        status="active",
         expected_students=len(students),
+        started_at=datetime.utcnow() - timedelta(minutes=18),
     )
     db.add(session)
     db.flush()
@@ -138,7 +154,7 @@ def seed_demo_data(db: Session) -> None:
             session_id=session.id,
             user_id=students[0].id,
             status=PresenceStatus.ACTIVE,
-            task_progress=72,
+            task_progress=68,
             help_requested=False,
             last_seen_at=now,
         ),
@@ -147,18 +163,18 @@ def seed_demo_data(db: Session) -> None:
             session_id=session.id,
             user_id=students[1].id,
             status=PresenceStatus.ACTIVE,
-            task_progress=63,
+            task_progress=100,
             help_requested=False,
-            last_seen_at=now - timedelta(seconds=8),
+            last_seen_at=now - timedelta(seconds=10),
         ),
         PresenceState(
             school_id=school_a.id,
             session_id=session.id,
             user_id=students[2].id,
             status=PresenceStatus.IDLE,
-            task_progress=40,
+            task_progress=42,
             help_requested=True,
-            last_seen_at=now - timedelta(seconds=34),
+            last_seen_at=now - timedelta(seconds=36),
         ),
         PresenceState(
             school_id=school_a.id,
@@ -181,12 +197,82 @@ def seed_demo_data(db: Session) -> None:
     ]
     db.add_all(presence_rows)
 
+    attendance_rows = [
+        AttendanceRecord(
+            school_id=school_a.id,
+            session_id=session.id,
+            user_id=students[0].id,
+            status=AttendanceStatus.PRESENT,
+            marked_by_user_id=teacher.id,
+            marked_at=now - timedelta(minutes=15),
+        ),
+        AttendanceRecord(
+            school_id=school_a.id,
+            session_id=session.id,
+            user_id=students[1].id,
+            status=AttendanceStatus.PRESENT,
+            marked_by_user_id=teacher.id,
+            marked_at=now - timedelta(minutes=14),
+        ),
+        AttendanceRecord(
+            school_id=school_a.id,
+            session_id=session.id,
+            user_id=students[2].id,
+            status=AttendanceStatus.LATE,
+            note="迟到后已进入课堂",
+            marked_by_user_id=teacher.id,
+            marked_at=now - timedelta(minutes=8),
+        ),
+        AttendanceRecord(
+            school_id=school_a.id,
+            session_id=session.id,
+            user_id=students[3].id,
+            status=AttendanceStatus.PENDING,
+        ),
+        AttendanceRecord(
+            school_id=school_a.id,
+            session_id=session.id,
+            user_id=students[4].id,
+            status=AttendanceStatus.ABSENT,
+            note="机房网络异常",
+            marked_by_user_id=teacher.id,
+            marked_at=now - timedelta(minutes=6),
+        ),
+    ]
+    db.add_all(attendance_rows)
+
+    db.add_all(
+        [
+            Submission(
+                school_id=school_a.id,
+                session_id=session.id,
+                user_id=students[0].id,
+                title="李同学图表草稿",
+                content="我先整理了温度与湿度数据，准备再补一张柱状图说明变化趋势。",
+                status=SubmissionStatus.DRAFT,
+                version=2,
+                draft_saved_at=now - timedelta(minutes=3),
+            ),
+            Submission(
+                school_id=school_a.id,
+                session_id=session.id,
+                user_id=students[1].id,
+                title="王同学图表作品",
+                content="我完成了折线图和结论说明，观察到中午之后温度开始快速上升。",
+                status=SubmissionStatus.SUBMITTED,
+                version=1,
+                draft_saved_at=now - timedelta(minutes=7),
+                submitted_at=now - timedelta(minutes=4),
+            ),
+        ]
+    )
+
     db.add(
         HelpRequest(
             school_id=school_a.id,
             session_id=session.id,
             user_id=students[2].id,
-            message="我不会完成图表的最后一步。",
+            message="老师，我不会完成图表的最后一步。",
             status="open",
         )
     )
@@ -197,7 +283,7 @@ def seed_demo_data(db: Session) -> None:
         status=MigrationStatus.PREVIEWED,
         progress=68,
         current_step="已完成字段预检，等待人工确认执行",
-        error_count=2,
+        error_count=1,
     )
     db.add(batch)
     db.flush()

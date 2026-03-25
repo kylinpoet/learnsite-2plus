@@ -3,7 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import ThemeStyle, UserRole
+from .models import AttendanceStatus, SubmissionStatus, ThemeStyle, UserRole
 
 
 class SchoolSummary(BaseModel):
@@ -55,18 +55,34 @@ class TodoItem(BaseModel):
     status: Literal["pending", "active", "done"]
 
 
+class StudentSubmissionSummary(BaseModel):
+    id: int | None = None
+    title: str
+    content: str
+    status: SubmissionStatus
+    version: int = 1
+    draft_saved_at: str | None = None
+    submitted_at: str | None = None
+    can_edit: bool = True
+
+
 class StudentHomeResponse(BaseModel):
     school_name: str
     student_name: str
     class_name: str
     lesson_title: str
     lesson_stage: str
+    assignment_title: str
+    assignment_prompt: str
+    session_status: str
     progress_percent: int
     progress_summary: str
     saved_at: str
     todo_items: list[TodoItem]
     highlights: list[str]
     help_open: bool
+    attendance_status: AttendanceStatus
+    submission: StudentSubmissionSummary
 
 
 class HeartbeatRequest(BaseModel):
@@ -77,6 +93,17 @@ class HelpRequestCreate(BaseModel):
     message: str
 
 
+class SubmissionUpsertRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=128)
+    content: str = Field(min_length=1, max_length=5000)
+
+
+class SubmissionActionResponse(BaseModel):
+    message: str
+    submission: StudentSubmissionSummary
+    updated_at: datetime
+
+
 class RadarSummary(BaseModel):
     online: int
     expected: int
@@ -84,6 +111,35 @@ class RadarSummary(BaseModel):
     idle: int
     not_started: int
     help_requests: int
+
+
+class TeacherLaunchOption(BaseModel):
+    classroom_id: int
+    classroom_name: str
+    course_id: int
+    course_title: str
+    stage_label: str
+
+
+class AttendanceRecordSummary(BaseModel):
+    id: int
+    student_name: str
+    student_username: str
+    status: AttendanceStatus
+    marked_at: str | None = None
+    note: str | None = None
+    last_seen_at: str | None = None
+
+
+class SubmissionQueueItem(BaseModel):
+    id: int
+    student_name: str
+    student_username: str
+    title: str
+    status: SubmissionStatus
+    version: int
+    draft_saved_at: str | None = None
+    submitted_at: str | None = None
 
 
 class TeacherDraft(BaseModel):
@@ -96,13 +152,18 @@ class TeacherDraft(BaseModel):
 
 
 class TeacherConsoleResponse(BaseModel):
+    session_id: int
     school_name: str
     teacher_name: str
     class_name: str
     lesson_title: str
+    assignment_title: str
     session_status: str
     radar: RadarSummary
     workbench_steps: list[TodoItem]
+    launch_options: list[TeacherLaunchOption]
+    attendance_records: list[AttendanceRecordSummary]
+    submissions: list[SubmissionQueueItem]
     ai_drafts: list[TeacherDraft]
 
 
@@ -112,6 +173,16 @@ class CreateDraftRequest(BaseModel):
 
 class CreateDraftResponse(BaseModel):
     draft: TeacherDraft
+
+
+class StartSessionRequest(BaseModel):
+    classroom_id: int
+    course_id: int
+
+
+class AttendanceMarkRequest(BaseModel):
+    status: AttendanceStatus
+    note: str | None = Field(default=None, max_length=255)
 
 
 class MigrationPreviewRow(BaseModel):
@@ -124,6 +195,7 @@ class MigrationPreviewRow(BaseModel):
 
 
 class MigrationBatchSummary(BaseModel):
+    id: int
     name: str
     status: str
     progress: int
@@ -132,12 +204,25 @@ class MigrationBatchSummary(BaseModel):
     preview_rows: list[MigrationPreviewRow]
 
 
+class LegacyMappingSummary(BaseModel):
+    id: int
+    entity_type: str
+    legacy_id: str
+    new_id: str
+    active: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class AdminOverviewResponse(BaseModel):
     school_name: str
     admin_name: str
     active_school_count: int
     managed_schools: list[SchoolSummary]
     active_migration: MigrationBatchSummary
+    legacy_mappings: list[LegacyMappingSummary]
+    can_execute_migration: bool
+    can_rollback_migration: bool
     guardrails: list[str]
 
 
