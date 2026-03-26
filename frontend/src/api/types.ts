@@ -1,6 +1,8 @@
 export type ThemeStyle = 'workshop' | 'material' | 'natural'
 export type LoginRole = 'student' | 'teacher'
 export type UserRole = 'student' | 'teacher' | 'school_admin' | 'platform_admin'
+export type ManagedTeacherRole = 'teacher' | 'school_admin'
+export type ResourceAudience = 'student' | 'teacher' | 'all'
 export type AttendanceStatus = 'pending' | 'present' | 'late' | 'absent' | 'excused'
 export type SubmissionStatus = 'draft' | 'submitted' | 'reviewed'
 export type ReviewDecision = 'approved' | 'revision_requested' | 'rejected'
@@ -73,6 +75,7 @@ export interface StudentHomeResponse {
   attendance_status: AttendanceStatus
   submission: StudentSubmissionSummary
   submission_history: SubmissionHistoryEntry[]
+  resources: StudentResourceSummary[]
 }
 
 export interface StudentSubmissionSummary {
@@ -110,6 +113,20 @@ export interface RadarSummary {
   help_requests: number
 }
 
+export interface StudentResourceSummary {
+  id: number
+  title: string
+  description?: string | null
+  category_id?: number | null
+  category_name?: string | null
+  classroom_name?: string | null
+  original_filename: string
+  file_size: number
+  file_size_label: string
+  download_count: number
+  uploaded_at: string
+}
+
 export interface TeacherDraft {
   id: number
   draft_type: string
@@ -119,8 +136,56 @@ export interface TeacherDraft {
   status: string
 }
 
+export interface TeacherAnalyticsAttentionStudent {
+  student_name: string
+  student_username: string
+  progress_percent: number
+  presence_status: string
+  reason: string
+}
+
+export interface TeacherSessionAnalytics {
+  attendance_rate: number
+  average_progress: number
+  submission_rate: number
+  reviewed_rate: number
+  present_count: number
+  late_count: number
+  absent_count: number
+  pending_count: number
+  draft_count: number
+  submitted_count: number
+  reviewed_count: number
+  approved_count: number
+  revision_requested_count: number
+  rejected_count: number
+  attention_students: TeacherAnalyticsAttentionStudent[]
+  highlights: string[]
+}
+
+export interface TeacherCourseSummary {
+  id: number
+  title: string
+  stage_label: string
+  overview?: string | null
+  assignment_title: string
+  assignment_prompt: string
+  is_published: boolean
+  published_at?: string | null
+}
+
+export interface TeacherReflectionSummary {
+  id?: number | null
+  strengths: string
+  risks: string
+  next_actions: string
+  student_support_plan: string
+  ai_draft_content?: string | null
+  updated_at?: string | null
+}
+
 export interface TeacherConsoleResponse {
-  session_id: number
+  session_id?: number | null
   school_name: string
   teacher_name: string
   class_name: string
@@ -129,10 +194,19 @@ export interface TeacherConsoleResponse {
   session_status: string
   radar: RadarSummary
   workbench_steps: TodoItem[]
+  lesson_plans: TeacherCourseSummary[]
+  managed_classrooms: TeacherClassroomSummary[]
+  resource_categories: ResourceCategorySummary[]
+  student_roster_scope: string
+  student_roster_live: boolean
+  student_roster: TeacherStudentRosterEntry[]
   launch_options: TeacherLaunchOption[]
+  resources: TeacherResourceSummary[]
   attendance_records: AttendanceRecordSummary[]
   help_requests: TeacherHelpRequestSummary[]
   submissions: SubmissionQueueItem[]
+  analytics: TeacherSessionAnalytics
+  reflection: TeacherReflectionSummary
   ai_drafts: TeacherDraft[]
 }
 
@@ -142,6 +216,47 @@ export interface TeacherLaunchOption {
   course_id: number
   course_title: string
   stage_label: string
+}
+
+export interface TeacherClassroomSummary {
+  id: number
+  name: string
+  grade_label: string
+}
+
+export interface TeacherStudentRosterEntry {
+  student_id: number
+  student_name: string
+  student_username: string
+  classroom_name: string
+  attendance_status?: AttendanceStatus | null
+  presence_status?: string | null
+  progress_percent: number
+  help_requested: boolean
+  submission_id?: number | null
+  submission_status?: SubmissionStatus | null
+  review_decision?: ReviewDecision | null
+  last_seen_at?: string | null
+  attention_reason?: string | null
+}
+
+export interface TeacherResourceSummary {
+  id: number
+  title: string
+  description?: string | null
+  audience: ResourceAudience
+  category_id?: number | null
+  category_name?: string | null
+  classroom_id?: number | null
+  classroom_name?: string | null
+  original_filename: string
+  file_size: number
+  file_size_label: string
+  download_count: number
+  uploaded_by_name: string
+  uploaded_at: string
+  active: boolean
+  can_manage: boolean
 }
 
 export interface AttendanceRecordSummary {
@@ -154,6 +269,14 @@ export interface AttendanceRecordSummary {
   last_seen_at?: string | null
 }
 
+export interface ResourceCategorySummary {
+  id: number
+  name: string
+  description?: string | null
+  sort_order: number
+  active: boolean
+}
+
 export interface AttendanceMarkPayload {
   status: AttendanceStatus
   note?: string
@@ -162,6 +285,16 @@ export interface AttendanceMarkPayload {
 export interface StartSessionPayload {
   classroom_id: number
   course_id: number
+}
+
+export interface TeacherCourseSavePayload {
+  course_id?: number | null
+  title: string
+  stage_label: string
+  overview?: string | null
+  assignment_title: string
+  assignment_prompt: string
+  publish_now: boolean
 }
 
 export interface TeacherHelpRequestSummary {
@@ -220,6 +353,32 @@ export interface SubmissionReviewPayload {
   resolve_help_requests: boolean
 }
 
+export interface TeacherReflectionPayload {
+  strengths: string
+  risks: string
+  next_actions: string
+  student_support_plan: string
+}
+
+export interface TeacherReflectionDraftResponse {
+  draft: TeacherDraft
+  reflection: TeacherReflectionSummary
+}
+
+export interface TeacherResourceStatusPayload {
+  active: boolean
+}
+
+export interface ResourceCategoryCreatePayload {
+  name: string
+  description?: string | null
+  sort_order: number
+}
+
+export interface ResourceCategoryStatusPayload {
+  active: boolean
+}
+
 export interface MigrationPreviewRow {
   id: number
   field_name: string
@@ -268,6 +427,42 @@ export interface GovernanceSchoolSnapshot {
   is_current: boolean
 }
 
+export interface AcademicTermSummary {
+  id: number
+  school_year_label: string
+  term_name: string
+  start_on?: string | null
+  end_on?: string | null
+  is_active: boolean
+  sort_order: number
+}
+
+export interface AdminClassroomSummary {
+  id: number
+  name: string
+  grade_label: string
+  student_count: number
+}
+
+export interface AdminStudentSummary {
+  id: number
+  username: string
+  display_name: string
+  classroom_id?: number | null
+  classroom_name?: string | null
+  active: boolean
+}
+
+export interface AdminTeacherSummary {
+  id: number
+  username: string
+  display_name: string
+  role: ManagedTeacherRole
+  active: boolean
+  assigned_classroom_ids: number[]
+  assigned_classroom_names: string[]
+}
+
 export interface AdminOverviewResponse {
   school_name: string
   admin_name: string
@@ -275,10 +470,62 @@ export interface AdminOverviewResponse {
   current_school: SchoolSummary
   managed_schools: SchoolSummary[]
   school_snapshots: GovernanceSchoolSnapshot[]
+  active_term?: AcademicTermSummary | null
+  academic_terms: AcademicTermSummary[]
+  classrooms: AdminClassroomSummary[]
+  resource_categories: ResourceCategorySummary[]
+  teacher_accounts: AdminTeacherSummary[]
+  students: AdminStudentSummary[]
   active_migration: MigrationBatch
   legacy_mappings: LegacyMappingSummary[]
   can_execute_migration: boolean
   can_rollback_migration: boolean
   unresolved_preview_count: number
   guardrails: string[]
+}
+
+export interface AcademicTermCreatePayload {
+  school_year_label: string
+  term_name: string
+  start_on?: string | null
+  end_on?: string | null
+  activate_now: boolean
+}
+
+export interface StudentAssignmentPayload {
+  classroom_id: number
+}
+
+export interface TeacherAccountSavePayload {
+  teacher_id?: number | null
+  username: string
+  display_name: string
+  role: ManagedTeacherRole
+  password?: string | null
+  classroom_ids: number[]
+}
+
+export interface StudentImportPayload {
+  classroom_id: number
+  rows_text: string
+  default_password: string
+}
+
+export interface PasswordResetPayload {
+  new_password: string
+}
+
+export interface UserStatusUpdatePayload {
+  active: boolean
+}
+
+export interface StudentImportResult {
+  imported_count: number
+  updated_count: number
+  skipped_count: number
+}
+
+export interface AdminStudentImportResponse {
+  overview: AdminOverviewResponse
+  result: StudentImportResult
 }

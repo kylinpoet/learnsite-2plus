@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 
-from sqlalchemy import Boolean, DateTime, Enum as SqlEnum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Enum as SqlEnum, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .core.database import Base
@@ -70,6 +70,12 @@ class SubmissionRevisionAction(str, Enum):
     SUBMITTED = "submitted"
 
 
+class ResourceAudience(str, Enum):
+    STUDENT = "student"
+    TEACHER = "teacher"
+    ALL = "all"
+
+
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -105,6 +111,30 @@ class Classroom(Base, TimestampMixin):
     students: Mapped[list["User"]] = relationship(back_populates="classroom")
 
 
+class TeacherClassroomAssignment(Base, TimestampMixin):
+    __tablename__ = "teacher_classroom_assignments"
+    __table_args__ = (UniqueConstraint("teacher_user_id", "classroom_id", name="uq_teacher_classroom_assignment"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
+    teacher_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    classroom_id: Mapped[int] = mapped_column(ForeignKey("classrooms.id"), index=True)
+
+
+class AcademicTerm(Base, TimestampMixin):
+    __tablename__ = "academic_terms"
+    __table_args__ = (UniqueConstraint("school_id", "school_year_label", "term_name", name="uq_terms_school_year_name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
+    school_year_label: Mapped[str] = mapped_column(String(32))
+    term_name: Mapped[str] = mapped_column(String(64))
+    start_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    end_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=1)
+
+
 class User(Base, TimestampMixin):
     __tablename__ = "users"
     __table_args__ = (UniqueConstraint("school_id", "username", name="uq_users_school_username"),)
@@ -129,8 +159,42 @@ class Course(Base, TimestampMixin):
     school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
     title: Mapped[str] = mapped_column(String(128))
     stage_label: Mapped[str] = mapped_column(String(64))
+    overview: Mapped[str | None] = mapped_column(Text, nullable=True)
     assignment_title: Mapped[str] = mapped_column(String(128))
     assignment_prompt: Mapped[str] = mapped_column(Text)
+    is_published: Mapped[bool] = mapped_column(default=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ResourceCategory(Base, TimestampMixin):
+    __tablename__ = "resource_categories"
+    __table_args__ = (UniqueConstraint("school_id", "name", name="uq_resource_categories_school_name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    description: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=1)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class LearningResource(Base, TimestampMixin):
+    __tablename__ = "learning_resources"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
+    classroom_id: Mapped[int | None] = mapped_column(ForeignKey("classrooms.id"), nullable=True, index=True)
+    category_id: Mapped[int | None] = mapped_column(ForeignKey("resource_categories.id"), nullable=True, index=True)
+    uploader_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(128))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audience: Mapped[ResourceAudience] = mapped_column(SqlEnum(ResourceAudience), index=True)
+    original_filename: Mapped[str] = mapped_column(String(255))
+    storage_key: Mapped[str] = mapped_column(String(255), unique=True)
+    content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    file_size: Mapped[int] = mapped_column(Integer, default=0)
+    download_count: Mapped[int] = mapped_column(Integer, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class ClassSession(Base, TimestampMixin):
@@ -302,3 +366,18 @@ class AISuggestionDraft(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(128))
     content: Mapped[str] = mapped_column(String(1000))
     status: Mapped[str] = mapped_column(String(32), default="draft")
+
+
+class SessionReflection(Base, TimestampMixin):
+    __tablename__ = "session_reflections"
+    __table_args__ = (UniqueConstraint("session_id", "teacher_id", name="uq_session_reflections_session_teacher"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("class_sessions.id"), index=True)
+    teacher_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    strengths: Mapped[str] = mapped_column(Text, default="")
+    risks: Mapped[str] = mapped_column(Text, default="")
+    next_actions: Mapped[str] = mapped_column(Text, default="")
+    student_support_plan: Mapped[str] = mapped_column(Text, default="")
+    ai_draft_content: Mapped[str | None] = mapped_column(Text, nullable=True)

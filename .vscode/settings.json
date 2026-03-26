@@ -19,7 +19,7 @@
   },
   "MicroPython.executeButton": [
     {
-      "text": "$(play)",
+      "text": "▶",
       "tooltip": "运行",
       "alignment": "left",
       "command": "extension.executeFile",

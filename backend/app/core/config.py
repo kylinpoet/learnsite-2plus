@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     app_name: str = "LearnSite 2+ API"
     api_prefix: str = "/api"
     sqlite_url: str = "sqlite:///./learnsite.db"
+    resource_storage_dir: str = "./storage/resources"
     cors_origins: list[str] = [
         "http://127.0.0.1:5173",
         "http://localhost:5173",

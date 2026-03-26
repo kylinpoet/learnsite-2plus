@@ -4,13 +4,14 @@ import asyncio
 import json
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..core.auth import Principal, require_roles
 from ..core.database import SessionLocal, get_db
+from ..core.resource_storage import resolve_resource_path, save_uploaded_resource
 from ..models import (
     AISuggestionDraft,
     AttendanceRecord,
@@ -19,14 +20,19 @@ from ..models import (
     Classroom,
     Course,
     HelpRequest,
+    LearningResource,
     PresenceState,
     PresenceStatus,
+    ResourceCategory,
+    ResourceAudience,
     ReviewDecision,
+    SessionReflection,
     Submission,
     SubmissionRevision,
     SubmissionRevisionAction,
     SubmissionReview,
     SubmissionStatus,
+    TeacherClassroomAssignment,
     User,
     UserRole,
 )
@@ -37,15 +43,27 @@ from ..schemas import (
     CreateDraftResponse,
     MessageResponse,
     RadarSummary,
+    TeacherCourseSaveRequest,
+    TeacherCourseSummary,
     StartSessionRequest,
     SubmissionHistoryEntry,
     SubmissionQueueItem,
     SubmissionReviewRequest,
     SubmissionReviewSummary,
+    TeacherAnalyticsAttentionStudent,
+    TeacherClassroomSummary,
     TeacherConsoleResponse,
     TeacherDraft,
     TeacherHelpRequestSummary,
     TeacherLaunchOption,
+    ResourceCategorySummary,
+    TeacherResourceStatusRequest,
+    TeacherResourceSummary,
+    TeacherReflectionDraftResponse,
+    TeacherReflectionRequest,
+    TeacherReflectionSummary,
+    TeacherSessionAnalytics,
+    TeacherStudentRosterEntry,
     TeacherSubmissionDetail,
     TodoItem,
 )
@@ -67,6 +85,14 @@ def _format_full(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M")
 
 
+def _format_file_size(file_size: int) -> str:
+    if file_size < 1024:
+        return f"{file_size} B"
+    if file_size < 1024 * 1024:
+        return f"{round(file_size / 1024, 1)} KB"
+    return f"{round(file_size / (1024 * 1024), 1)} MB"
+
+
 def _shorten(text: str, *, limit: int = 96) -> str:
     compact = " ".join(text.split())
     if len(compact) <= limit:
@@ -83,6 +109,12 @@ def _decision_label(decision: ReviewDecision) -> str:
     return labels[decision]
 
 
+def _safe_percent(numerator: int, denominator: int) -> int:
+    if denominator <= 0:
+        return 0
+    return round((numerator / denominator) * 100)
+
+
 def _resolve_operator(db: Session, principal: Principal) -> User:
     operator = db.scalar(
         select(User).where(
@@ -95,7 +127,46 @@ def _resolve_operator(db: Session, principal: Principal) -> User:
     return operator
 
 
-def _get_current_session(db: Session, principal: Principal, operator: User) -> tuple[ClassSession, Course, Classroom]:
+def _get_accessible_classroom_ids(db: Session, principal: Principal, operator: User) -> list[int]:
+    if principal.role != UserRole.TEACHER:
+        return list(
+            db.scalars(select(Classroom.id).where(Classroom.school_id == principal.school_id).order_by(Classroom.id)).all()
+        )
+
+    return list(
+        db.scalars(
+            select(TeacherClassroomAssignment.classroom_id)
+            .where(
+                TeacherClassroomAssignment.school_id == principal.school_id,
+                TeacherClassroomAssignment.teacher_user_id == operator.id,
+            )
+            .order_by(TeacherClassroomAssignment.classroom_id)
+        ).all()
+    )
+
+
+def _list_managed_classrooms(db: Session, principal: Principal, accessible_classroom_ids: list[int]) -> list[TeacherClassroomSummary]:
+    query = select(Classroom).where(Classroom.school_id == principal.school_id)
+    if principal.role == UserRole.TEACHER:
+        if not accessible_classroom_ids:
+            return []
+        query = query.where(Classroom.id.in_(accessible_classroom_ids))
+    classrooms = db.scalars(query.order_by(Classroom.grade_label, Classroom.name, Classroom.id)).all()
+    return [
+        TeacherClassroomSummary(
+            id=classroom.id,
+            name=classroom.name,
+            grade_label=classroom.grade_label,
+        )
+        for classroom in classrooms
+    ]
+
+
+def _find_current_session(
+    db: Session,
+    principal: Principal,
+    operator: User,
+) -> tuple[ClassSession, Course, Classroom] | None:
     query = select(ClassSession).where(
         ClassSession.school_id == principal.school_id,
         ClassSession.status == "active",
@@ -111,13 +182,20 @@ def _get_current_session(db: Session, principal: Principal, operator: User) -> t
         session_obj = db.scalar(fallback_query.order_by(ClassSession.started_at.desc()))
 
     if session_obj is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No teaching session found.")
+        return None
 
     course = db.get(Course, session_obj.course_id)
     classroom = db.get(Classroom, session_obj.classroom_id)
     if course is None or classroom is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Teaching context is incomplete.")
     return session_obj, course, classroom
+
+
+def _get_current_session(db: Session, principal: Principal, operator: User) -> tuple[ClassSession, Course, Classroom]:
+    current_session = _find_current_session(db, principal, operator)
+    if current_session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No teaching session found.")
+    return current_session
 
 
 def _get_submission(
@@ -134,6 +212,51 @@ def _get_submission(
     if submission is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Submission not found.")
     return submission
+
+
+def _get_course(db: Session, principal: Principal, course_id: int) -> Course:
+    course = db.scalar(
+        select(Course).where(
+            Course.id == course_id,
+            Course.school_id == principal.school_id,
+        )
+    )
+    if course is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
+    return course
+
+
+def _get_classroom(db: Session, principal: Principal, classroom_id: int) -> Classroom:
+    classroom = db.scalar(
+        select(Classroom).where(
+            Classroom.id == classroom_id,
+            Classroom.school_id == principal.school_id,
+        )
+    )
+    if classroom is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Classroom not found.")
+    return classroom
+
+
+def _ensure_teacher_session_access(db: Session, principal: Principal, operator: User, session_id: int) -> None:
+    if principal.role != UserRole.TEACHER:
+        return
+    owned_session = db.scalar(
+        select(ClassSession.id).where(
+            ClassSession.id == session_id,
+            ClassSession.school_id == principal.school_id,
+            ClassSession.teacher_id == operator.id,
+        )
+    )
+    if owned_session is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Current teacher cannot access another classroom session.",
+        )
+
+
+def _ensure_teacher_submission_access(db: Session, principal: Principal, operator: User, submission: Submission) -> None:
+    _ensure_teacher_session_access(db, principal, operator, submission.session_id)
 
 
 def _build_radar_summary(db: Session, session_obj: ClassSession) -> RadarSummary:
@@ -177,9 +300,56 @@ def _serialize_draft(draft: AISuggestionDraft) -> TeacherDraft:
     )
 
 
-def _list_launch_options(db: Session, school_id: int) -> list[TeacherLaunchOption]:
-    classrooms = db.scalars(select(Classroom).where(Classroom.school_id == school_id).order_by(Classroom.id)).all()
-    courses = db.scalars(select(Course).where(Course.school_id == school_id).order_by(Course.id)).all()
+def _serialize_course(course: Course) -> TeacherCourseSummary:
+    return TeacherCourseSummary(
+        id=course.id,
+        title=course.title,
+        stage_label=course.stage_label,
+        overview=course.overview,
+        assignment_title=course.assignment_title,
+        assignment_prompt=course.assignment_prompt,
+        is_published=course.is_published,
+        published_at=_format_full(course.published_at) if course.published_at else None,
+    )
+
+
+def _serialize_reflection(reflection: SessionReflection | None) -> TeacherReflectionSummary:
+    if reflection is None:
+        return TeacherReflectionSummary()
+    return TeacherReflectionSummary(
+        id=reflection.id,
+        strengths=reflection.strengths,
+        risks=reflection.risks,
+        next_actions=reflection.next_actions,
+        student_support_plan=reflection.student_support_plan,
+        ai_draft_content=reflection.ai_draft_content,
+        updated_at=_format_full(reflection.updated_at),
+    )
+
+
+def _get_session_reflection(db: Session, session_id: int, teacher_id: int) -> SessionReflection | None:
+    return db.scalar(
+        select(SessionReflection).where(
+            SessionReflection.session_id == session_id,
+            SessionReflection.teacher_id == teacher_id,
+        )
+    )
+
+
+def _list_launch_options(db: Session, school_id: int, accessible_classroom_ids: list[int]) -> list[TeacherLaunchOption]:
+    if not accessible_classroom_ids:
+        return []
+    classrooms = db.scalars(
+        select(Classroom)
+        .where(
+            Classroom.school_id == school_id,
+            Classroom.id.in_(accessible_classroom_ids),
+        )
+        .order_by(Classroom.id)
+    ).all()
+    courses = db.scalars(
+        select(Course).where(Course.school_id == school_id, Course.is_published.is_(True)).order_by(Course.id)
+    ).all()
     options: list[TeacherLaunchOption] = []
     for classroom in classrooms:
         for course in courses:
@@ -193,6 +363,255 @@ def _list_launch_options(db: Session, school_id: int) -> list[TeacherLaunchOptio
                 )
             )
     return options
+
+
+def _list_courses(db: Session, school_id: int) -> list[TeacherCourseSummary]:
+    courses = db.scalars(select(Course).where(Course.school_id == school_id).order_by(Course.updated_at.desc())).all()
+    return [_serialize_course(course) for course in courses]
+
+
+def _serialize_resource_category(category: ResourceCategory) -> ResourceCategorySummary:
+    return ResourceCategorySummary(
+        id=category.id,
+        name=category.name,
+        description=category.description,
+        sort_order=category.sort_order,
+        active=category.active,
+    )
+
+
+def _list_resource_categories(db: Session, school_id: int, *, active_only: bool = False) -> list[ResourceCategorySummary]:
+    query = select(ResourceCategory).where(ResourceCategory.school_id == school_id)
+    if active_only:
+        query = query.where(ResourceCategory.active.is_(True))
+    categories = db.scalars(query.order_by(ResourceCategory.sort_order, ResourceCategory.id)).all()
+    return [_serialize_resource_category(category) for category in categories]
+
+
+def _get_resource_category(
+    db: Session,
+    principal: Principal,
+    category_id: int,
+    *,
+    active_only: bool = False,
+) -> ResourceCategory:
+    query = select(ResourceCategory).where(
+        ResourceCategory.id == category_id,
+        ResourceCategory.school_id == principal.school_id,
+    )
+    if active_only:
+        query = query.where(ResourceCategory.active.is_(True))
+    category = db.scalar(query)
+    if category is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource category not found.")
+    return category
+
+
+def _get_default_resource_category_id(db: Session, principal: Principal) -> int | None:
+    category = db.scalar(
+        select(ResourceCategory)
+        .where(
+            ResourceCategory.school_id == principal.school_id,
+            ResourceCategory.active.is_(True),
+        )
+        .order_by(ResourceCategory.sort_order, ResourceCategory.id)
+    )
+    return category.id if category is not None else None
+
+
+def _get_resource(db: Session, principal: Principal, resource_id: int) -> LearningResource:
+    resource = db.scalar(
+        select(LearningResource).where(
+            LearningResource.id == resource_id,
+            LearningResource.school_id == principal.school_id,
+        )
+    )
+    if resource is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found.")
+    return resource
+
+
+def _can_access_resource(
+    principal: Principal,
+    operator: User,
+    resource: LearningResource,
+    accessible_classroom_ids: list[int],
+) -> bool:
+    if principal.role != UserRole.TEACHER:
+        return True
+    if resource.uploader_user_id == operator.id:
+        return True
+    if resource.classroom_id is None:
+        return True
+    return resource.classroom_id in accessible_classroom_ids
+
+
+def _can_manage_resource(principal: Principal, operator: User, resource: LearningResource) -> bool:
+    if principal.role != UserRole.TEACHER:
+        return True
+    return resource.uploader_user_id == operator.id
+
+
+def _serialize_teacher_resource(
+    db: Session,
+    principal: Principal,
+    operator: User,
+    resource: LearningResource,
+) -> TeacherResourceSummary:
+    classroom = db.get(Classroom, resource.classroom_id) if resource.classroom_id else None
+    category = db.get(ResourceCategory, resource.category_id) if resource.category_id else None
+    uploader = db.get(User, resource.uploader_user_id)
+    return TeacherResourceSummary(
+        id=resource.id,
+        title=resource.title,
+        description=resource.description,
+        audience=resource.audience,
+        category_id=resource.category_id,
+        category_name=category.name if category else None,
+        classroom_id=resource.classroom_id,
+        classroom_name=classroom.name if classroom else None,
+        original_filename=resource.original_filename,
+        file_size=resource.file_size,
+        file_size_label=_format_file_size(resource.file_size),
+        download_count=resource.download_count,
+        uploaded_by_name=uploader.display_name if uploader else "教师",
+        uploaded_at=_format_full(resource.created_at),
+        active=resource.active,
+        can_manage=_can_manage_resource(principal, operator, resource),
+    )
+
+
+def _list_teacher_resources(
+    db: Session,
+    principal: Principal,
+    operator: User,
+    accessible_classroom_ids: list[int],
+) -> list[TeacherResourceSummary]:
+    resources = db.scalars(
+        select(LearningResource)
+        .where(LearningResource.school_id == principal.school_id)
+        .order_by(LearningResource.active.desc(), LearningResource.created_at.desc(), LearningResource.id.desc())
+    ).all()
+    return [
+        _serialize_teacher_resource(db, principal, operator, resource)
+        for resource in resources
+        if _can_access_resource(principal, operator, resource, accessible_classroom_ids)
+    ]
+
+
+def _build_student_roster(
+    db: Session,
+    principal: Principal,
+    accessible_classroom_ids: list[int],
+    session_obj: ClassSession | None,
+) -> tuple[str, bool, list[TeacherStudentRosterEntry]]:
+    if session_obj is not None:
+        target_classroom_ids = [session_obj.classroom_id]
+        current_classroom = db.get(Classroom, session_obj.classroom_id)
+        scope = f"{current_classroom.name if current_classroom else '当前班级'} · 课堂花名册"
+        live = True
+        attendance_map = {
+            row.user_id: row
+            for row in db.scalars(select(AttendanceRecord).where(AttendanceRecord.session_id == session_obj.id)).all()
+        }
+        presence_map = {
+            row.user_id: row
+            for row in db.scalars(select(PresenceState).where(PresenceState.session_id == session_obj.id)).all()
+        }
+        submission_map = {
+            row.user_id: row
+            for row in db.scalars(select(Submission).where(Submission.session_id == session_obj.id)).all()
+        }
+    else:
+        live = False
+        if principal.role == UserRole.TEACHER:
+            target_classroom_ids = accessible_classroom_ids
+            scope = "已分配班级学生名册"
+        else:
+            target_classroom_ids = list(
+                db.scalars(select(Classroom.id).where(Classroom.school_id == principal.school_id).order_by(Classroom.id)).all()
+            )
+            scope = "全校学生名册"
+        attendance_map: dict[int, AttendanceRecord] = {}
+        presence_map: dict[int, PresenceState] = {}
+        submission_map: dict[int, Submission] = {}
+
+    if not target_classroom_ids:
+        fallback_scope = "暂无已分配班级" if principal.role == UserRole.TEACHER else scope
+        return fallback_scope, live, []
+
+    classroom_map = {
+        classroom.id: classroom
+        for classroom in db.scalars(
+            select(Classroom)
+            .where(Classroom.school_id == principal.school_id, Classroom.id.in_(target_classroom_ids))
+            .order_by(Classroom.grade_label, Classroom.name, Classroom.id)
+        ).all()
+    }
+    students = db.scalars(
+        select(User)
+        .where(
+            User.school_id == principal.school_id,
+            User.role == UserRole.STUDENT,
+            User.active.is_(True),
+            User.classroom_id.in_(target_classroom_ids),
+        )
+        .order_by(User.classroom_id, User.username, User.id)
+    ).all()
+
+    rows: list[tuple[int, str, TeacherStudentRosterEntry]] = []
+    for student in students:
+        attendance = attendance_map.get(student.id)
+        presence = presence_map.get(student.id)
+        submission = submission_map.get(student.id)
+
+        priority = 0
+        attention_reason: str | None = None
+        if live:
+            if presence and presence.help_requested:
+                priority = 100
+                attention_reason = "学生正在举手求助，建议优先响应。"
+            elif attendance and attendance.status in {AttendanceStatus.ABSENT, AttendanceStatus.EXCUSED}:
+                priority = 90
+                attention_reason = "学生尚未完成到课确认，需要核对课堂进入情况。"
+            elif presence and presence.status == PresenceStatus.OFFLINE:
+                priority = 80
+                attention_reason = "学生心跳已超时，可能离线或设备异常。"
+            elif presence and presence.status == PresenceStatus.NOT_STARTED:
+                priority = 70
+                attention_reason = "学生还没有进入课堂任务，建议提醒开始。"
+            elif presence and presence.status == PresenceStatus.IDLE:
+                priority = 60
+                attention_reason = "学生当前进度停滞，建议巡看是否卡住。"
+            elif submission and submission.status == SubmissionStatus.SUBMITTED:
+                priority = 50
+                attention_reason = "作品已提交，正在等待教师批改。"
+
+        classroom = classroom_map.get(student.classroom_id)
+        rows.append(
+            (
+                priority,
+                student.username,
+                TeacherStudentRosterEntry(
+                    student_id=student.id,
+                    student_name=student.display_name,
+                    student_username=student.username,
+                    classroom_name=classroom.name if classroom else "未分班",
+                    attendance_status=attendance.status if attendance else None,
+                    presence_status=presence.status.value if presence else None,
+                    progress_percent=presence.task_progress if presence else 0,
+                    help_requested=presence.help_requested if presence else False,
+                    submission_id=submission.id if submission else None,
+                    submission_status=submission.status if submission else None,
+                    review_decision=submission.review_decision if submission else None,
+                    last_seen_at=_format_hms(presence.last_seen_at) if presence else None,
+                    attention_reason=attention_reason,
+                ),
+            )
+        )
+
+    rows.sort(key=lambda item: (-item[0], item[2].classroom_name, item[1]))
+    return scope, live, [item[2] for item in rows]
 
 
 def _serialize_attendance(db: Session, session_obj: ClassSession) -> list[AttendanceRecordSummary]:
@@ -400,8 +819,257 @@ def _serialize_submission_detail(db: Session, submission: Submission) -> Teacher
     )
 
 
+def _build_session_analytics(db: Session, session_obj: ClassSession) -> TeacherSessionAnalytics:
+    attendance_records = db.scalars(
+        select(AttendanceRecord).where(AttendanceRecord.session_id == session_obj.id).order_by(AttendanceRecord.id)
+    ).all()
+    presence_rows = db.scalars(
+        select(PresenceState).where(PresenceState.session_id == session_obj.id).order_by(PresenceState.id)
+    ).all()
+    submissions = db.scalars(
+        select(Submission).where(Submission.session_id == session_obj.id).order_by(Submission.id)
+    ).all()
+    students = db.scalars(
+        select(User).where(
+            User.school_id == session_obj.school_id,
+            User.classroom_id == session_obj.classroom_id,
+            User.role == UserRole.STUDENT,
+            User.active.is_(True),
+        )
+    ).all()
+
+    expected = session_obj.expected_students or len(students)
+    attendance_map = {record.user_id: record for record in attendance_records}
+    presence_map = {row.user_id: row for row in presence_rows}
+    submission_map = {submission.user_id: submission for submission in submissions}
+
+    present_count = sum(1 for record in attendance_records if record.status == AttendanceStatus.PRESENT)
+    late_count = sum(1 for record in attendance_records if record.status == AttendanceStatus.LATE)
+    absent_count = sum(1 for record in attendance_records if record.status in {AttendanceStatus.ABSENT, AttendanceStatus.EXCUSED})
+    pending_count = sum(1 for record in attendance_records if record.status == AttendanceStatus.PENDING)
+
+    draft_count = sum(1 for submission in submissions if submission.status == SubmissionStatus.DRAFT)
+    submitted_count = sum(1 for submission in submissions if submission.status == SubmissionStatus.SUBMITTED)
+    reviewed_count = sum(1 for submission in submissions if submission.status == SubmissionStatus.REVIEWED)
+    approved_count = sum(1 for submission in submissions if submission.review_decision == ReviewDecision.APPROVED)
+    revision_requested_count = sum(
+        1 for submission in submissions if submission.review_decision == ReviewDecision.REVISION_REQUESTED
+    )
+    rejected_count = sum(1 for submission in submissions if submission.review_decision == ReviewDecision.REJECTED)
+
+    average_progress = round(sum(row.task_progress for row in presence_rows) / len(presence_rows)) if presence_rows else 0
+    help_request_count = sum(1 for row in presence_rows if row.help_requested)
+    not_started_count = sum(1 for row in presence_rows if row.status == PresenceStatus.NOT_STARTED)
+    stalled_count = sum(1 for row in presence_rows if row.status in {PresenceStatus.IDLE, PresenceStatus.OFFLINE})
+
+    attention_candidates: list[tuple[int, TeacherAnalyticsAttentionStudent]] = []
+    for student in students:
+        attendance = attendance_map.get(student.id)
+        presence = presence_map.get(student.id)
+        submission = submission_map.get(student.id)
+
+        priority = 0
+        reason = ""
+        progress_percent = presence.task_progress if presence else 0
+        presence_status = presence.status.value if presence else PresenceStatus.NOT_STARTED.value
+
+        if presence and presence.help_requested:
+            priority = 90
+            reason = "学生正在举手求助，建议优先回应。"
+        elif attendance and attendance.status in {AttendanceStatus.ABSENT, AttendanceStatus.EXCUSED}:
+            priority = 80
+            reason = "学生未正常到课，需要确认课堂进入情况。"
+        elif presence and presence.status == PresenceStatus.OFFLINE:
+            priority = 75
+            reason = "学生长时间离线，可能存在网络或设备问题。"
+        elif presence and presence.status == PresenceStatus.NOT_STARTED:
+            priority = 70
+            reason = "学生尚未进入任务，建议提醒开始作品。"
+        elif presence and presence.status == PresenceStatus.IDLE:
+            priority = 65
+            reason = "学生进度停滞，可能卡在某个操作步骤。"
+        elif submission and submission.status == SubmissionStatus.DRAFT and progress_percent < 60:
+            priority = 55
+            reason = "作品仍为草稿且进度偏慢，需要过程性支持。"
+        elif submission and submission.status == SubmissionStatus.SUBMITTED:
+            priority = 45
+            reason = "学生作品已提交，等待教师批改反馈。"
+
+        if priority > 0:
+            attention_candidates.append(
+                (
+                    priority,
+                    TeacherAnalyticsAttentionStudent(
+                        student_name=student.display_name,
+                        student_username=student.username,
+                        progress_percent=progress_percent,
+                        presence_status=presence_status,
+                        reason=reason,
+                    ),
+                )
+            )
+
+    attention_candidates.sort(key=lambda item: (-item[0], item[1].student_username))
+    attention_students = [item[1] for item in attention_candidates[:5]]
+
+    submitted_or_reviewed = submitted_count + reviewed_count
+    attendance_rate = _safe_percent(present_count + late_count, expected)
+    submission_rate = _safe_percent(submitted_or_reviewed, expected)
+    reviewed_rate = _safe_percent(reviewed_count, submitted_or_reviewed) if submitted_or_reviewed else 0
+
+    highlights = [
+        f"出勤率 {attendance_rate}% ，已到课 {present_count + late_count}/{expected} 人。",
+        f"课堂平均进度 {average_progress}% ，当前有 {help_request_count} 人求助，{stalled_count + not_started_count} 人需要额外关注。",
+        f"作品已提交 {submitted_or_reviewed}/{expected} 份，已发布反馈 {reviewed_count} 份。",
+    ]
+    if revision_requested_count > 0:
+        highlights.append(f"已有 {revision_requested_count} 份作品进入“修改后重交”，需要后续追踪。")
+
+    return TeacherSessionAnalytics(
+        attendance_rate=attendance_rate,
+        average_progress=average_progress,
+        submission_rate=submission_rate,
+        reviewed_rate=reviewed_rate,
+        present_count=present_count,
+        late_count=late_count,
+        absent_count=absent_count,
+        pending_count=pending_count,
+        draft_count=draft_count,
+        submitted_count=submitted_count,
+        reviewed_count=reviewed_count,
+        approved_count=approved_count,
+        revision_requested_count=revision_requested_count,
+        rejected_count=rejected_count,
+        attention_students=attention_students,
+        highlights=highlights,
+    )
+
+
+def _build_reflection_draft_fields(
+    course: Course,
+    classroom: Classroom,
+    analytics: TeacherSessionAnalytics,
+) -> tuple[str, str, str, str, str]:
+    strengths = (
+        f"《{course.title}》在 {classroom.name} 的课堂推进总体稳定，出勤率达到 {analytics.attendance_rate}% ，"
+        f"班级平均任务进度为 {analytics.average_progress}% 。课堂中已有 {analytics.reviewed_count} 份作品完成反馈，"
+        "说明学生已逐步进入“完成任务并接受修正”的节奏。"
+    )
+
+    risks = (
+        f"当前仍有 {analytics.pending_count + analytics.absent_count} 名学生未稳定完成到课确认，"
+        f"{analytics.draft_count} 份作品仍停留在草稿态，另有 {analytics.revision_requested_count} 份作品需要修改后重交。"
+        "后续要重点盯住进度停滞、未进入任务和持续求助的学生。"
+    )
+
+    next_actions = (
+        "下一课前先复盘本节课中最容易卡住的操作步骤，补一轮 3 分钟的集中演示；"
+        "课堂中把“开始任务、提交作品、查看反馈”三个关键节点明确写到投屏提示里；"
+        "课后优先处理已提交未反馈和需要重交的作品。"
+    )
+
+    student_support_plan = (
+        "对当前进度明显偏慢或多次求助的学生安排近距离巡看；"
+        "对已进入修改后重交状态的学生给出更具体的补改要求；"
+        "对已经高质量完成作品的学生，下一节课可引导其承担同伴示范角色。"
+    )
+
+    draft_content = "\n".join(
+        [
+            f"课堂亮点：{strengths}",
+            f"课堂风险：{risks}",
+            f"下一步动作：{next_actions}",
+            f"学生支持计划：{student_support_plan}",
+        ]
+    )
+    return strengths, risks, next_actions, student_support_plan, draft_content
+
+
+def _empty_analytics() -> TeacherSessionAnalytics:
+    return TeacherSessionAnalytics(
+        attendance_rate=0,
+        average_progress=0,
+        submission_rate=0,
+        reviewed_rate=0,
+        present_count=0,
+        late_count=0,
+        absent_count=0,
+        pending_count=0,
+        draft_count=0,
+        submitted_count=0,
+        reviewed_count=0,
+        approved_count=0,
+        revision_requested_count=0,
+        rejected_count=0,
+        attention_students=[],
+        highlights=[
+            "当前还没有进行中的课堂，先选择班级与已发布学案开始一节新课。",
+            "如果你是新加入教师，请先在治理面板确认已分配可授课班级。",
+        ],
+    )
+
+
+def _build_idle_console_response(
+    db: Session,
+    principal: Principal,
+    operator: User,
+    accessible_classroom_ids: list[int],
+) -> TeacherConsoleResponse:
+    managed_classrooms = _list_managed_classrooms(db, principal, accessible_classroom_ids)
+    student_roster_scope, student_roster_live, student_roster = _build_student_roster(
+        db,
+        principal,
+        accessible_classroom_ids,
+        None,
+    )
+    launch_options = _list_launch_options(db, principal.school_id, accessible_classroom_ids)
+    resources = _list_teacher_resources(db, principal, operator, accessible_classroom_ids)
+    steps = [
+        TodoItem(
+            title="确认当前教师已分配可授课班级",
+            status="done" if accessible_classroom_ids else "active",
+        ),
+        TodoItem(
+            title="选择班级与已发布学案并开始新课次",
+            status="active" if launch_options else "pending",
+        ),
+        TodoItem(title="开课后再进入签到、雷达与批改工作流", status="pending"),
+    ]
+    return TeacherConsoleResponse(
+        session_id=None,
+        school_name=principal.school_name,
+        teacher_name=operator.display_name,
+        class_name="待开课",
+        lesson_title="请选择班级与学案",
+        assignment_title="尚未开始课程",
+        session_status="idle",
+        radar=RadarSummary(online=0, expected=0, absent=0, idle=0, not_started=0, help_requests=0),
+        workbench_steps=steps,
+        lesson_plans=_list_courses(db, principal.school_id),
+        managed_classrooms=managed_classrooms,
+        resource_categories=_list_resource_categories(db, principal.school_id, active_only=False),
+        student_roster_scope=student_roster_scope,
+        student_roster_live=student_roster_live,
+        student_roster=student_roster,
+        launch_options=launch_options,
+        resources=resources,
+        attendance_records=[],
+        help_requests=[],
+        submissions=[],
+        analytics=_empty_analytics(),
+        reflection=TeacherReflectionSummary(),
+        ai_drafts=[],
+    )
+
+
 def _build_console_response(db: Session, principal: Principal, operator: User) -> TeacherConsoleResponse:
-    session_obj, course, classroom = _get_current_session(db, principal, operator)
+    accessible_classroom_ids = _get_accessible_classroom_ids(db, principal, operator)
+    managed_classrooms = _list_managed_classrooms(db, principal, accessible_classroom_ids)
+    current_session = _find_current_session(db, principal, operator)
+    if current_session is None:
+        return _build_idle_console_response(db, principal, operator, accessible_classroom_ids)
+
+    session_obj, course, classroom = current_session
     drafts = db.scalars(
         select(AISuggestionDraft)
         .where(AISuggestionDraft.teacher_id == operator.id, AISuggestionDraft.session_id == session_obj.id)
@@ -410,6 +1078,15 @@ def _build_console_response(db: Session, principal: Principal, operator: User) -
 
     submission_items = _serialize_submissions(db, session_obj)
     help_requests = _serialize_help_requests(db, session_obj)
+    analytics = _build_session_analytics(db, session_obj)
+    reflection = _serialize_reflection(_get_session_reflection(db, session_obj.id, operator.id))
+    student_roster_scope, student_roster_live, student_roster = _build_student_roster(
+        db,
+        principal,
+        accessible_classroom_ids,
+        session_obj,
+    )
+    resources = _list_teacher_resources(db, principal, operator, accessible_classroom_ids)
     review_ready_count = sum(item.status != SubmissionStatus.DRAFT for item in submission_items)
     workbench_steps = [
         TodoItem(title="开课并确认课堂上下文", status="done" if session_obj.status == "active" else "pending"),
@@ -442,10 +1119,19 @@ def _build_console_response(db: Session, principal: Principal, operator: User) -
         session_status=session_obj.status,
         radar=_build_radar_summary(db, session_obj),
         workbench_steps=workbench_steps,
-        launch_options=_list_launch_options(db, principal.school_id),
+        lesson_plans=_list_courses(db, principal.school_id),
+        managed_classrooms=managed_classrooms,
+        resource_categories=_list_resource_categories(db, principal.school_id, active_only=False),
+        student_roster_scope=student_roster_scope,
+        student_roster_live=student_roster_live,
+        student_roster=student_roster,
+        launch_options=_list_launch_options(db, principal.school_id, accessible_classroom_ids),
+        resources=resources,
         attendance_records=_serialize_attendance(db, session_obj),
         help_requests=help_requests,
         submissions=submission_items,
+        analytics=analytics,
+        reflection=reflection,
         ai_drafts=[_serialize_draft(draft) for draft in drafts],
     )
 
@@ -486,8 +1172,9 @@ def teacher_submission_detail(
     principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
     db: Session = Depends(get_db),
 ) -> TeacherSubmissionDetail:
-    _resolve_operator(db, principal)
+    operator = _resolve_operator(db, principal)
     submission = _get_submission(db, principal, submission_id)
+    _ensure_teacher_submission_access(db, principal, operator, submission)
     return _serialize_submission_detail(db, submission)
 
 
@@ -500,6 +1187,7 @@ def review_submission(
 ) -> TeacherSubmissionDetail:
     operator = _resolve_operator(db, principal)
     submission = _get_submission(db, principal, submission_id)
+    _ensure_teacher_submission_access(db, principal, operator, submission)
     if submission.status == SubmissionStatus.DRAFT:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft submission cannot be reviewed yet.")
 
@@ -535,6 +1223,7 @@ def create_feedback_draft(
 ) -> CreateDraftResponse:
     operator = _resolve_operator(db, principal)
     submission = _get_submission(db, principal, submission_id)
+    _ensure_teacher_submission_access(db, principal, operator, submission)
     if submission.status == SubmissionStatus.DRAFT:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft submission cannot generate feedback.")
 
@@ -572,6 +1261,241 @@ def create_feedback_draft(
     return CreateDraftResponse(draft=_serialize_draft(draft))
 
 
+@router.post("/courses", response_model=TeacherCourseSummary)
+def save_course(
+    payload: TeacherCourseSaveRequest,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherCourseSummary:
+    _resolve_operator(db, principal)
+    if payload.course_id is not None:
+        course = _get_course(db, principal, payload.course_id)
+    else:
+        course = Course(
+            school_id=principal.school_id,
+            title=payload.title.strip(),
+            stage_label=payload.stage_label.strip(),
+            assignment_title=payload.assignment_title.strip(),
+            assignment_prompt=payload.assignment_prompt.strip(),
+            overview=payload.overview.strip() if payload.overview else None,
+            is_published=False,
+        )
+        db.add(course)
+
+    course.title = payload.title.strip()
+    course.stage_label = payload.stage_label.strip()
+    course.overview = payload.overview.strip() if payload.overview else None
+    course.assignment_title = payload.assignment_title.strip()
+    course.assignment_prompt = payload.assignment_prompt.strip()
+    if payload.publish_now:
+        course.is_published = True
+        course.published_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(course)
+    return _serialize_course(course)
+
+
+@router.post("/courses/{course_id}/publish", response_model=TeacherCourseSummary)
+def publish_course(
+    course_id: int,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherCourseSummary:
+    _resolve_operator(db, principal)
+    course = _get_course(db, principal, course_id)
+    course.is_published = True
+    course.published_at = datetime.utcnow()
+    db.commit()
+    db.refresh(course)
+    return _serialize_course(course)
+
+
+@router.post("/courses/{course_id}/unpublish", response_model=TeacherCourseSummary)
+def unpublish_course(
+    course_id: int,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherCourseSummary:
+    _resolve_operator(db, principal)
+    course = _get_course(db, principal, course_id)
+    course.is_published = False
+    db.commit()
+    db.refresh(course)
+    return _serialize_course(course)
+
+
+@router.post("/resources", response_model=TeacherResourceSummary)
+async def upload_resource(
+    title: str = Form(...),
+    audience: ResourceAudience = Form(...),
+    description: str | None = Form(default=None),
+    category_id: int | None = Form(default=None),
+    classroom_id: int | None = Form(default=None),
+    upload: UploadFile = File(...),
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherResourceSummary:
+    operator = _resolve_operator(db, principal)
+    accessible_classroom_ids = _get_accessible_classroom_ids(db, principal, operator)
+
+    normalized_title = title.strip()
+    if not normalized_title:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Resource title is required.")
+    if not upload.filename:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Upload file is required.")
+
+    resolved_category_id = category_id
+    if resolved_category_id is None:
+        resolved_category_id = _get_default_resource_category_id(db, principal)
+    if resolved_category_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No active resource category is available for this school.",
+        )
+    _get_resource_category(db, principal, resolved_category_id, active_only=True)
+
+    if principal.role == UserRole.TEACHER:
+        if classroom_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Teachers must select one assigned classroom for resource publishing.",
+            )
+        if classroom_id not in accessible_classroom_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Current teacher cannot publish resources to the selected classroom.",
+            )
+    elif classroom_id is not None:
+        _get_classroom(db, principal, classroom_id)
+
+    storage_key, file_size = await save_uploaded_resource(upload, principal.school_code)
+    resource = LearningResource(
+        school_id=principal.school_id,
+        classroom_id=classroom_id,
+        category_id=resolved_category_id,
+        uploader_user_id=operator.id,
+        title=normalized_title,
+        description=description.strip() if description and description.strip() else None,
+        audience=audience,
+        original_filename=upload.filename,
+        storage_key=storage_key,
+        content_type=upload.content_type,
+        file_size=file_size,
+        active=True,
+    )
+    db.add(resource)
+    db.commit()
+    db.refresh(resource)
+    return _serialize_teacher_resource(db, principal, operator, resource)
+
+
+@router.post("/resources/{resource_id}/status", response_model=TeacherResourceSummary)
+def update_resource_status(
+    resource_id: int,
+    payload: TeacherResourceStatusRequest,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherResourceSummary:
+    operator = _resolve_operator(db, principal)
+    resource = _get_resource(db, principal, resource_id)
+    if not _can_manage_resource(principal, operator, resource):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Current session cannot manage this resource.")
+    resource.active = payload.active
+    db.commit()
+    db.refresh(resource)
+    return _serialize_teacher_resource(db, principal, operator, resource)
+
+
+@router.get("/resources/{resource_id}/download")
+def download_teacher_resource(
+    resource_id: int,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    operator = _resolve_operator(db, principal)
+    accessible_classroom_ids = _get_accessible_classroom_ids(db, principal, operator)
+    resource = _get_resource(db, principal, resource_id)
+    if not _can_access_resource(principal, operator, resource, accessible_classroom_ids):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Current session cannot access this resource.")
+
+    file_path = resolve_resource_path(resource.storage_key)
+    if not file_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored resource file is missing.")
+
+    resource.download_count += 1
+    db.commit()
+    return FileResponse(
+        path=file_path,
+        filename=resource.original_filename,
+        media_type=resource.content_type or "application/octet-stream",
+    )
+
+
+@router.post("/reflection", response_model=TeacherReflectionSummary)
+def save_reflection(
+    payload: TeacherReflectionRequest,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherReflectionSummary:
+    operator = _resolve_operator(db, principal)
+    session_obj, _, _ = _get_current_session(db, principal, operator)
+    reflection = _get_session_reflection(db, session_obj.id, operator.id)
+    if reflection is None:
+        reflection = SessionReflection(
+            school_id=principal.school_id,
+            session_id=session_obj.id,
+            teacher_id=operator.id,
+        )
+        db.add(reflection)
+
+    reflection.strengths = payload.strengths.strip()
+    reflection.risks = payload.risks.strip()
+    reflection.next_actions = payload.next_actions.strip()
+    reflection.student_support_plan = payload.student_support_plan.strip()
+
+    db.commit()
+    db.refresh(reflection)
+    return _serialize_reflection(reflection)
+
+
+@router.post("/reflection/draft", response_model=TeacherReflectionDraftResponse)
+def create_reflection_draft(
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherReflectionDraftResponse:
+    operator = _resolve_operator(db, principal)
+    session_obj, course, classroom = _get_current_session(db, principal, operator)
+    analytics = _build_session_analytics(db, session_obj)
+    strengths, risks, next_actions, student_support_plan, draft_content = _build_reflection_draft_fields(
+        course,
+        classroom,
+        analytics,
+    )
+    draft = AISuggestionDraft(
+        school_id=principal.school_id,
+        teacher_id=operator.id,
+        session_id=session_obj.id,
+        draft_type="教学反思草稿",
+        title=f"{course.title} · {classroom.name} · 教学反思",
+        content=draft_content,
+        status="draft",
+    )
+    db.add(draft)
+    db.commit()
+    db.refresh(draft)
+    return TeacherReflectionDraftResponse(
+        draft=_serialize_draft(draft),
+        reflection=TeacherReflectionSummary(
+            strengths=strengths,
+            risks=risks,
+            next_actions=next_actions,
+            student_support_plan=student_support_plan,
+            ai_draft_content=draft_content,
+        ),
+    )
+
+
 @router.post("/session/start", response_model=TeacherConsoleResponse)
 def start_session(
     payload: StartSessionRequest,
@@ -579,6 +1503,7 @@ def start_session(
     db: Session = Depends(get_db),
 ) -> TeacherConsoleResponse:
     operator = _resolve_operator(db, principal)
+    accessible_classroom_ids = _get_accessible_classroom_ids(db, principal, operator)
     classroom = db.scalar(
         select(Classroom).where(Classroom.id == payload.classroom_id, Classroom.school_id == principal.school_id)
     )
@@ -587,6 +1512,11 @@ def start_session(
     )
     if classroom is None or course is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Classroom or course not found.")
+    if principal.role == UserRole.TEACHER and classroom.id not in accessible_classroom_ids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Current teacher is not assigned to the selected classroom.",
+        )
 
     active_sessions = db.scalars(
         select(ClassSession).where(
@@ -661,6 +1591,7 @@ def mark_attendance(
     )
     if attendance is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attendance record not found.")
+    _ensure_teacher_session_access(db, principal, operator, attendance.session_id)
 
     now = datetime.utcnow()
     attendance.status = payload.status

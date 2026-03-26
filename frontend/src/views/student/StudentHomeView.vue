@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ElMessage } from 'element-plus'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { apiClient } from '../../api/client'
+import { apiClient, buildApiUrl } from '../../api/client'
 import type {
   ReviewDecision,
   StudentHomeResponse,
+  StudentResourceSummary,
   StudentSubmissionSummary,
   SubmissionActionResponse,
   SubmissionHistoryEntry,
@@ -20,6 +21,8 @@ const loading = ref(true)
 const savingDraft = ref(false)
 const submitting = ref(false)
 const error = ref('')
+const studentResourceQuery = ref('')
+const studentResourceCategoryFilter = ref<'any' | number>('any')
 let heartbeatTimer: ReturnType<typeof window.setInterval> | undefined
 
 const navItems = [{ label: '当前课堂', to: '/student/home' }]
@@ -40,6 +43,36 @@ function syncSubmissionForm(submission: StudentSubmissionSummary) {
 }
 
 const latestReview = computed(() => home.value?.submission.review_decision ?? null)
+const hasActiveSession = computed(() => home.value?.session_status === 'active')
+const studentResourceCategories = computed(() => {
+  const categoryMap = new Map<number, string>()
+  for (const resource of home.value?.resources ?? []) {
+    if (resource.category_id && resource.category_name) {
+      categoryMap.set(resource.category_id, resource.category_name)
+    }
+  }
+  return Array.from(categoryMap.entries())
+    .map(([id, name]) => ({ id, name }))
+    .sort((left, right) => left.id - right.id)
+})
+const filteredResources = computed(() => {
+  const keyword = studentResourceQuery.value.trim().toLowerCase()
+  const resources = home.value?.resources ?? []
+  return resources.filter((resource) => {
+    if (studentResourceCategoryFilter.value !== 'any' && resource.category_id !== studentResourceCategoryFilter.value) {
+      return false
+    }
+    if (!keyword) {
+      return true
+    }
+    return (
+      resource.title.toLowerCase().includes(keyword) ||
+      resource.original_filename.toLowerCase().includes(keyword) ||
+      (resource.description ?? '').toLowerCase().includes(keyword) ||
+      (resource.classroom_name ?? '').toLowerCase().includes(keyword)
+    )
+  })
+})
 
 function submissionStatusLabel(submission: StudentSubmissionSummary) {
   if (submission.status === 'reviewed' && submission.review_decision) {
@@ -81,6 +114,15 @@ function historyLabel(entry: SubmissionHistoryEntry) {
   return `草稿 v${entry.version ?? ''}`.trim()
 }
 
+function downloadStudentResource(resource: StudentResourceSummary) {
+  const token = sessionState.value?.token
+  if (!token) {
+    return
+  }
+  const url = buildApiUrl(`/student/resources/${resource.id}/download?token=${encodeURIComponent(token)}`)
+  window.open(url, '_blank', 'noopener')
+}
+
 async function loadHome() {
   loading.value = true
   try {
@@ -97,6 +139,9 @@ async function loadHome() {
 }
 
 async function sendHeartbeat(announce = true) {
+  if (!hasActiveSession.value) {
+    return
+  }
   try {
     await apiClient.post('/student/heartbeat', {
       task_progress: home.value?.progress_percent ?? 72,
@@ -110,6 +155,10 @@ async function sendHeartbeat(announce = true) {
 }
 
 async function askForHelp() {
+  if (!hasActiveSession.value) {
+    ElMessage.warning('当前没有进行中的课堂，暂时无法发起课堂求助')
+    return
+  }
   try {
     await apiClient.post('/student/help-requests', {
       message: '老师，我需要帮助完善当前课堂作品。',
@@ -123,6 +172,10 @@ async function askForHelp() {
 }
 
 async function persistSubmission(mode: 'draft' | 'submit') {
+  if (!hasActiveSession.value) {
+    ElMessage.warning('当前没有进行中的课堂任务，请先查看资源中心里的学习资料')
+    return
+  }
   if (!submissionForm.title.trim() || !submissionForm.content.trim()) {
     ElMessage.warning('请先填写作品标题和内容')
     return
@@ -150,10 +203,12 @@ async function persistSubmission(mode: 'draft' | 'submit') {
 
 onMounted(async () => {
   await loadHome()
-  await sendHeartbeat(false)
-  heartbeatTimer = window.setInterval(() => {
-    void sendHeartbeat(false)
-  }, 25000)
+  if (hasActiveSession.value) {
+    await sendHeartbeat(false)
+    heartbeatTimer = window.setInterval(() => {
+      void sendHeartbeat(false)
+    }, 25000)
+  }
 })
 
 onBeforeUnmount(() => {
@@ -189,8 +244,8 @@ onBeforeUnmount(() => {
               </span>
             </div>
             <div class="inline-actions">
-              <el-button type="primary" @click="sendHeartbeat()">刷新课堂状态</el-button>
-              <el-button plain :disabled="home.help_open" @click="askForHelp()">
+              <el-button type="primary" :disabled="!hasActiveSession" @click="sendHeartbeat()">刷新课堂状态</el-button>
+              <el-button plain :disabled="!hasActiveSession || home.help_open" @click="askForHelp()">
                 {{ home.help_open ? '已发送求助' : '向老师举手求助' }}
               </el-button>
             </div>
@@ -225,6 +280,13 @@ onBeforeUnmount(() => {
           <div class="section-kicker">Assignment</div>
           <h2 class="section-heading">{{ home.assignment_title }}</h2>
           <p class="muted" style="margin-bottom: 18px;">{{ home.assignment_prompt }}</p>
+          <el-alert
+            v-if="!hasActiveSession"
+            type="info"
+            :closable="false"
+            title="当前没有进行中的课堂任务，你可以先查看下方资源中心里的资料。"
+            style="margin-bottom: 16px;"
+          />
 
           <el-form label-position="top">
             <el-form-item label="作品标题">
@@ -232,7 +294,7 @@ onBeforeUnmount(() => {
                 v-model="submissionForm.title"
                 maxlength="128"
                 placeholder="例如：我的课堂图表作品"
-                :disabled="!home.submission.can_edit"
+                :disabled="!hasActiveSession || !home.submission.can_edit"
               />
             </el-form-item>
 
@@ -244,15 +306,26 @@ onBeforeUnmount(() => {
                 maxlength="5000"
                 show-word-limit
                 placeholder="填写你的数据观察、图表说明和课堂结论"
-                :disabled="!home.submission.can_edit"
+                :disabled="!hasActiveSession || !home.submission.can_edit"
               />
             </el-form-item>
 
             <div class="inline-actions">
-              <el-button type="primary" plain :loading="savingDraft" :disabled="!home.submission.can_edit" @click="persistSubmission('draft')">
+              <el-button
+                type="primary"
+                plain
+                :loading="savingDraft"
+                :disabled="!hasActiveSession || !home.submission.can_edit"
+                @click="persistSubmission('draft')"
+              >
                 保存草稿
               </el-button>
-              <el-button type="primary" :loading="submitting" :disabled="!home.submission.can_edit" @click="persistSubmission('submit')">
+              <el-button
+                type="primary"
+                :loading="submitting"
+                :disabled="!hasActiveSession || !home.submission.can_edit"
+                @click="persistSubmission('submit')"
+              >
                 正式提交
               </el-button>
             </div>
@@ -288,6 +361,55 @@ onBeforeUnmount(() => {
               <div>{{ highlight }}</div>
             </div>
           </div>
+        </div>
+      </section>
+
+      <section class="surface-card" style="padding: 24px;">
+        <div class="section-kicker">Resource Center</div>
+        <h2 class="section-heading">学习资源</h2>
+        <div v-if="home.resources.length > 0" class="page-grid page-grid--two" style="margin-bottom: 16px;">
+          <el-input
+            v-model="studentResourceQuery"
+            clearable
+            placeholder="搜索资源标题、文件名或班级"
+          />
+          <el-select v-model="studentResourceCategoryFilter" class="full-width">
+            <el-option label="全部分类" value="any" />
+            <el-option
+              v-for="category in studentResourceCategories"
+              :key="category.id"
+              :label="category.name"
+              :value="category.id"
+            />
+          </el-select>
+        </div>
+        <div v-if="filteredResources.length > 0" class="detail-list">
+          <div
+            v-for="resource in filteredResources"
+            :key="resource.id"
+            class="detail-item"
+            style="display: grid; gap: 10px;"
+          >
+            <div class="inline-actions" style="justify-content: space-between;">
+              <div class="inline-actions" style="justify-content: flex-start; flex-wrap: wrap;">
+                <el-tag type="success">{{ resource.classroom_name || '学校共享' }}</el-tag>
+                <el-tag v-if="resource.category_name" type="warning">{{ resource.category_name }}</el-tag>
+                <strong>{{ resource.title }}</strong>
+              </div>
+              <span class="muted">{{ resource.original_filename }}</span>
+            </div>
+            <div v-if="resource.description">{{ resource.description }}</div>
+            <div class="muted">{{ resource.file_size_label }} · {{ resource.uploaded_at }} · Downloads {{ resource.download_count }}</div>
+            <div class="inline-actions">
+              <el-button size="small" plain @click="downloadStudentResource(resource)">下载资料</el-button>
+            </div>
+          </div>
+        </div>
+        <div v-else-if="home.resources.length > 0" class="empty-state">
+          当前筛选条件下没有匹配的学习资源。
+        </div>
+        <div v-else class="empty-state">
+          当前还没有可下载的学习资源，等老师上传后会自动出现在这里。
         </div>
       </section>
 

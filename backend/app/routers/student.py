@@ -3,11 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..core.auth import Principal, require_roles
 from ..core.database import get_db
+from ..core.resource_storage import resolve_resource_path
 from ..models import (
     AttendanceRecord,
     AttendanceStatus,
@@ -15,8 +17,11 @@ from ..models import (
     Classroom,
     Course,
     HelpRequest,
+    LearningResource,
     PresenceState,
     PresenceStatus,
+    ResourceCategory,
+    ResourceAudience,
     ReviewDecision,
     Submission,
     SubmissionRevision,
@@ -30,6 +35,7 @@ from ..schemas import (
     HeartbeatRequest,
     HelpRequestCreate,
     MessageResponse,
+    StudentResourceSummary,
     StudentHomeResponse,
     StudentSubmissionSummary,
     SubmissionActionResponse,
@@ -47,6 +53,14 @@ def _format_hm(value: datetime | None) -> str | None:
 
 def _format_full(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M")
+
+
+def _format_file_size(file_size: int) -> str:
+    if file_size < 1024:
+        return f"{file_size} B"
+    if file_size < 1024 * 1024:
+        return f"{round(file_size / 1024, 1)} KB"
+    return f"{round(file_size / (1024 * 1024), 1)} MB"
 
 
 def _shorten(text: str, *, limit: int = 72) -> str:
@@ -69,11 +83,11 @@ def _get_student(db: Session, principal: Principal) -> User:
     return student
 
 
-def _get_active_session(
+def _find_active_session(
     db: Session,
     school_id: int,
     classroom_id: int | None,
-) -> tuple[ClassSession, Course, Classroom]:
+) -> tuple[ClassSession, Course, Classroom] | None:
     session_obj = db.scalar(
         select(ClassSession)
         .where(
@@ -84,13 +98,24 @@ def _get_active_session(
         .order_by(ClassSession.started_at.desc())
     )
     if session_obj is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active class session.")
+        return None
 
     course = db.get(Course, session_obj.course_id)
     classroom = db.get(Classroom, session_obj.classroom_id)
     if course is None or classroom is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Teaching context is incomplete.")
     return session_obj, course, classroom
+
+
+def _get_active_session(
+    db: Session,
+    school_id: int,
+    classroom_id: int | None,
+) -> tuple[ClassSession, Course, Classroom]:
+    active_session = _find_active_session(db, school_id, classroom_id)
+    if active_session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active class session.")
+    return active_session
 
 
 def _get_or_create_presence(db: Session, principal: Principal, session_id: int, user_id: int) -> PresenceState:
@@ -172,6 +197,70 @@ def _serialize_submission(submission: Submission | None, reviewer_name: str | No
         reviewed_at=_format_hm(submission.reviewed_at),
         reviewed_by=reviewer_name,
         can_edit=can_edit,
+    )
+
+
+def _serialize_student_resource(db: Session, resource: LearningResource) -> StudentResourceSummary:
+    classroom = db.get(Classroom, resource.classroom_id) if resource.classroom_id else None
+    category = db.get(ResourceCategory, resource.category_id) if resource.category_id else None
+    return StudentResourceSummary(
+        id=resource.id,
+        title=resource.title,
+        description=resource.description,
+        category_id=resource.category_id,
+        category_name=category.name if category else None,
+        classroom_name=classroom.name if classroom else None,
+        original_filename=resource.original_filename,
+        file_size=resource.file_size,
+        file_size_label=_format_file_size(resource.file_size),
+        download_count=resource.download_count,
+        uploaded_at=_format_full(resource.created_at),
+    )
+
+
+def _list_student_resources(db: Session, principal: Principal, student: User) -> list[StudentResourceSummary]:
+    resources = db.scalars(
+        select(LearningResource)
+        .where(
+            LearningResource.school_id == principal.school_id,
+            LearningResource.active.is_(True),
+            LearningResource.audience.in_((ResourceAudience.STUDENT, ResourceAudience.ALL)),
+        )
+        .order_by(LearningResource.created_at.desc(), LearningResource.id.desc())
+    ).all()
+    return [
+        _serialize_student_resource(db, resource)
+        for resource in resources
+        if resource.classroom_id is None or resource.classroom_id == student.classroom_id
+    ]
+
+
+def _build_idle_home_response(db: Session, principal: Principal, student: User, classroom: Classroom | None) -> StudentHomeResponse:
+    return StudentHomeResponse(
+        school_name=principal.school_name,
+        student_name=student.display_name,
+        class_name=classroom.name if classroom else "未分班",
+        lesson_title="今日暂无进行中课程",
+        lesson_stage="资源中心",
+        assignment_title="等待教师开课",
+        assignment_prompt="当前没有进行中的课堂任务，你可以先查看老师上传的学习资料并做好下节课准备。",
+        session_status="idle",
+        progress_percent=0,
+        progress_summary="今天暂时没有进行中的课次，保持关注教师通知，也可以先浏览资料中心里的学习资源。",
+        saved_at="尚未开始",
+        todo_items=[
+            TodoItem(title="查看老师共享的学习资料", status="active"),
+            TodoItem(title="等待教师开始新的课堂课次", status="pending"),
+        ],
+        highlights=[
+            "当教师开始新课后，这里会自动切换到当前课堂任务页。",
+            "资料中心里的资源会按学校和班级自动筛选，只展示与你相关的内容。",
+        ],
+        help_open=False,
+        attendance_status=AttendanceStatus.PENDING,
+        submission=_serialize_submission(None),
+        submission_history=[],
+        resources=_list_student_resources(db, principal, student),
     )
 
 
@@ -333,7 +422,12 @@ def student_home(
     db: Session = Depends(get_db),
 ) -> StudentHomeResponse:
     student = _get_student(db, principal)
-    session_obj, course, classroom = _get_active_session(db, principal.school_id, student.classroom_id)
+    classroom = db.get(Classroom, student.classroom_id) if student.classroom_id else None
+    active_session = _find_active_session(db, principal.school_id, student.classroom_id)
+    if active_session is None:
+        return _build_idle_home_response(db, principal, student, classroom)
+
+    session_obj, course, classroom = active_session
     presence = _get_or_create_presence(db, principal, session_obj.id, student.id)
     attendance = _get_or_create_attendance(db, principal, session_obj.id, student.id)
     submission = db.scalar(
@@ -385,6 +479,7 @@ def student_home(
         attendance_status=attendance.status,
         submission=_serialize_submission(submission, reviewer_name),
         submission_history=_build_submission_history(db, submission),
+        resources=_list_student_resources(db, principal, student),
     )
 
 
@@ -488,4 +583,37 @@ def submit_assignment(
         message="Submission completed.",
         submission=_serialize_submission(submission, reviewer_name),
         updated_at=updated_at,
+    )
+
+
+@router.get("/resources/{resource_id}/download")
+def download_student_resource(
+    resource_id: int,
+    principal: Principal = Depends(require_roles(UserRole.STUDENT)),
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    student = _get_student(db, principal)
+    resource = db.scalar(
+        select(LearningResource).where(
+            LearningResource.id == resource_id,
+            LearningResource.school_id == principal.school_id,
+            LearningResource.active.is_(True),
+            LearningResource.audience.in_((ResourceAudience.STUDENT, ResourceAudience.ALL)),
+        )
+    )
+    if resource is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found.")
+    if resource.classroom_id is not None and resource.classroom_id != student.classroom_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Current student cannot access this resource.")
+
+    file_path = resolve_resource_path(resource.storage_key)
+    if not file_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored resource file is missing.")
+
+    resource.download_count += 1
+    db.commit()
+    return FileResponse(
+        path=file_path,
+        filename=resource.original_filename,
+        media_type=resource.content_type or "application/octet-stream",
     )
