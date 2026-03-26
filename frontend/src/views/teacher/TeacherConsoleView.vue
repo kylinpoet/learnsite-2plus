@@ -1500,21 +1500,20 @@ onBeforeUnmount(() => {
               </el-form-item>
             </div>
             <el-form-item label="所属班级">
-                <el-select
-                  v-model="resourceForm.classroom_id"
-                  class="full-width"
-                  :placeholder="mustChooseResourceClassroom ? '请选择班级' : '可留空表示学校共享'"
-                  clearable
-                >
-                  <el-option
-                    v-for="classroom in managedClassrooms"
-                    :key="classroom.id"
-                    :label="`${classroom.grade_label} · ${classroom.name}`"
-                    :value="classroom.id"
-                  />
-                </el-select>
-              </el-form-item>
-            </div>
+              <el-select
+                v-model="resourceForm.classroom_id"
+                class="full-width"
+                :placeholder="mustChooseResourceClassroom ? '请选择班级' : '可留空表示学校共享'"
+                clearable
+              >
+                <el-option
+                  v-for="classroom in managedClassrooms"
+                  :key="classroom.id"
+                  :label="`${classroom.grade_label} · ${classroom.name}`"
+                  :value="classroom.id"
+                />
+              </el-select>
+            </el-form-item>
             <el-form-item label="资源说明">
               <el-input
                 v-model="resourceForm.description"
