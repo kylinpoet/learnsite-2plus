@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ElMessage } from 'element-plus'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { apiClient, buildApiUrl } from '../../api/client'
+import { apiClient, downloadApiFile } from '../../api/client'
 import type {
   ReviewDecision,
   StudentHomeResponse,
@@ -114,13 +114,13 @@ function historyLabel(entry: SubmissionHistoryEntry) {
   return `草稿 v${entry.version ?? ''}`.trim()
 }
 
-function downloadStudentResource(resource: StudentResourceSummary) {
-  const token = sessionState.value?.token
-  if (!token) {
-    return
+async function downloadStudentResource(resource: StudentResourceSummary) {
+  try {
+    await downloadApiFile(`/student/resources/${resource.id}/download`, resource.original_filename)
+  } catch (requestError) {
+    ElMessage.error('下载资料失败')
+    console.error(requestError)
   }
-  const url = buildApiUrl(`/student/resources/${resource.id}/download?token=${encodeURIComponent(token)}`)
-  window.open(url, '_blank', 'noopener')
 }
 
 async function loadHome() {

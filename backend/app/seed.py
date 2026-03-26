@@ -5,16 +5,20 @@ from datetime import date, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .core.auth import hash_password
+from .core.auth import hash_password, verify_password
+from .core.clock import utc_now
 from .core.resource_storage import ensure_seed_resource_file
 from .models import (
     AcademicTerm,
+    ActivitySubmission,
     AISuggestionDraft,
     AttendanceRecord,
     AttendanceStatus,
     ClassSession,
     Classroom,
     Course,
+    CourseActivity,
+    CourseActivityType,
     HelpRequest,
     LegacyIdMapping,
     LearningResource,
@@ -249,6 +253,118 @@ def _ensure_resource_categories(
     return category_map
 
 
+def _ensure_course_activity(
+    db: Session,
+    *,
+    course: Course,
+    position: int,
+    title: str,
+    activity_type: CourseActivityType,
+    instructions_html: str,
+    summary: str | None = None,
+) -> bool:
+    existing = db.scalar(
+        select(CourseActivity).where(
+            CourseActivity.course_id == course.id,
+            CourseActivity.position == position,
+        )
+    )
+    if existing is None:
+        existing = CourseActivity(
+            school_id=course.school_id,
+            course_id=course.id,
+            position=position,
+            title=title,
+            activity_type=activity_type,
+            instructions_html=instructions_html,
+            summary=summary,
+        )
+        db.add(existing)
+        db.flush()
+        return True
+
+    changed = False
+    if existing.title != title:
+        existing.title = title
+        changed = True
+    if existing.activity_type != activity_type:
+        existing.activity_type = activity_type
+        changed = True
+    if existing.instructions_html != instructions_html:
+        existing.instructions_html = instructions_html
+        changed = True
+    if existing.summary != summary:
+        existing.summary = summary
+        changed = True
+    if changed:
+        db.flush()
+    return changed
+
+
+def _ensure_demo_user(
+    db: Session,
+    *,
+    school_id: int,
+    username: str,
+    display_name: str,
+    password: str,
+    role: UserRole,
+    classroom_id: int | None = None,
+    active: bool = True,
+) -> tuple[User, bool]:
+    user = next(
+        (
+            pending_user
+            for pending_user in db.new
+            if isinstance(pending_user, User)
+            and pending_user.school_id == school_id
+            and pending_user.username == username
+        ),
+        None,
+    )
+    if user is None:
+        user = db.scalar(
+            select(User).where(
+                User.school_id == school_id,
+                User.username == username,
+            )
+        )
+    if user is None:
+        user = User(
+            school_id=school_id,
+            classroom_id=classroom_id,
+            username=username,
+            display_name=display_name,
+            password_hash=hash_password(password),
+            role=role,
+            active=active,
+        )
+        db.add(user)
+        db.flush()
+        return user, True
+
+    changed = False
+    if user.classroom_id != classroom_id:
+        user.classroom_id = classroom_id
+        changed = True
+    if user.display_name != display_name:
+        user.display_name = display_name
+        changed = True
+    if user.role != role:
+        user.role = role
+        changed = True
+    if user.active != active:
+        user.active = active
+        changed = True
+    if not verify_password(password, user.password_hash):
+        user.password_hash = hash_password(password)
+        changed = True
+
+    if changed:
+        db.flush()
+    return user, changed
+
+
 def _ensure_multi_school_demo_data(db: Session) -> None:
     changed = False
     default_resource_categories = [
@@ -268,12 +384,67 @@ def _ensure_multi_school_demo_data(db: Session) -> None:
         categories=default_resource_categories,
     )
 
-    teacher_a = db.scalar(
-        select(User).where(
-            User.school_id == school_a.id,
-            User.username == "kylin",
+    class_a1 = db.scalar(
+        select(Classroom).where(
+            Classroom.school_id == school_a.id,
+            Classroom.name == "八年级 1 班",
         )
     )
+    if class_a1 is None:
+        class_a1 = Classroom(school_id=school_a.id, name="八年级 1 班", grade_label="八年级")
+        db.add(class_a1)
+        db.flush()
+        changed = True
+
+    class_a2 = db.scalar(
+        select(Classroom).where(
+            Classroom.school_id == school_a.id,
+            Classroom.name == "八年级 2 班",
+        )
+    )
+    if class_a2 is None:
+        class_a2 = Classroom(school_id=school_a.id, name="八年级 2 班", grade_label="八年级")
+        db.add(class_a2)
+        db.flush()
+        changed = True
+
+    teacher_a, teacher_a_changed = _ensure_demo_user(
+        db,
+        school_id=school_a.id,
+        username="kylin",
+        display_name="Kylin 老师",
+        password="222221",
+        role=UserRole.TEACHER,
+    )
+    changed = teacher_a_changed or changed
+    _, admin_a_changed = _ensure_demo_user(
+        db,
+        school_id=school_a.id,
+        username="admin",
+        display_name="学校管理员",
+        password="222221",
+        role=UserRole.SCHOOL_ADMIN,
+    )
+    changed = admin_a_changed or changed
+
+    for username, display_name in [
+        ("240101", "李同学"),
+        ("240102", "王同学"),
+        ("240103", "张同学"),
+        ("240104", "陈同学"),
+        ("240105", "赵同学"),
+    ]:
+        _, student_changed = _ensure_demo_user(
+            db,
+            school_id=school_a.id,
+            classroom_id=class_a1.id,
+            username=username,
+            display_name=display_name,
+            password="12345",
+            role=UserRole.STUDENT,
+        )
+        changed = student_changed or changed
+
     session_a = None
     if teacher_a is not None:
         session_a = db.scalar(
@@ -360,6 +531,15 @@ def _ensure_multi_school_demo_data(db: Session) -> None:
             )
         )
         changed = True
+    _, platform_admin_changed = _ensure_demo_user(
+        db,
+        school_id=school_a.id,
+        username="platform",
+        display_name="平台管理员",
+        password="222221",
+        role=UserRole.PLATFORM_ADMIN,
+    )
+    changed = platform_admin_changed or changed
 
     school_b = db.scalar(select(School).where(School.code == "school-b"))
     if school_b is None:
@@ -469,7 +649,7 @@ def _ensure_multi_school_demo_data(db: Session) -> None:
             assignment_title="传感器课堂记录卡",
             assignment_prompt="整理本节课的温湿度采集结果，用 1 张图表和 2 条结论说明你的观察。",
             is_published=True,
-            published_at=datetime.utcnow() - timedelta(days=7),
+            published_at=utc_now() - timedelta(days=7),
         )
         course_data = Course(
             school_id=school_b.id,
@@ -479,7 +659,7 @@ def _ensure_multi_school_demo_data(db: Session) -> None:
             assignment_title="班级数据小报草稿",
             assignment_prompt="把课堂调查结果整理成小报，包含标题、图表、说明文字和一个结论。",
             is_published=True,
-            published_at=datetime.utcnow() - timedelta(days=5),
+            published_at=utc_now() - timedelta(days=5),
         )
         db.add_all([course_robot, course_data])
         db.flush()
@@ -493,12 +673,12 @@ def _ensure_multi_school_demo_data(db: Session) -> None:
             stage=course_robot.stage_label,
             status="active",
             expected_students=len(students_b),
-            started_at=datetime.utcnow() - timedelta(minutes=12),
+            started_at=utc_now() - timedelta(minutes=12),
         )
         db.add(session_b)
         db.flush()
 
-        now = datetime.utcnow()
+        now = utc_now()
         db.add_all(
             [
                 PresenceState(
@@ -744,6 +924,40 @@ def _ensure_multi_school_demo_data(db: Session) -> None:
         )
         changed = True
 
+    teacher_b, teacher_b_changed = _ensure_demo_user(
+        db,
+        school_id=school_b.id,
+        username="linhua",
+        display_name="林华老师",
+        password="222221",
+        role=UserRole.TEACHER,
+    )
+    changed = teacher_b_changed or changed
+    _, admin_b_changed = _ensure_demo_user(
+        db,
+        school_id=school_b.id,
+        username="adminb",
+        display_name="未来学校管理员",
+        password="222221",
+        role=UserRole.SCHOOL_ADMIN,
+    )
+    changed = admin_b_changed or changed
+    for username, display_name in [
+        ("250201", "周同学"),
+        ("250202", "吴同学"),
+        ("250203", "郑同学"),
+    ]:
+        _, student_b_changed = _ensure_demo_user(
+            db,
+            school_id=school_b.id,
+            classroom_id=class_b1.id,
+            username=username,
+            display_name=display_name,
+            password="12345",
+            role=UserRole.STUDENT,
+        )
+        changed = student_b_changed or changed
+
     if teacher_b is not None and not created_school_b_demo:
         changed = (
             _ensure_teacher_classroom_assignments(
@@ -789,6 +1003,58 @@ def _ensure_multi_school_demo_data(db: Session) -> None:
                     next_actions="下节课先补结论写法示范，再安排同伴互查和二次提交。",
                     student_support_plan="优先巡看求助和停滞学生，对完成较好的学生安排示范分享。",
                     ai_draft_content="课堂亮点：学生已能完成基础采集与图表整理。\n课堂风险：结论表达还不稳定，存在持续求助学生。\n下一步动作：补示范、做互查、再收一次改进版作品。\n学生支持计划：优先照看求助和停滞学生。",
+                )
+                or changed
+            )
+
+    for course in db.scalars(select(Course).where(Course.school_id == school_a.id)).all():
+        if course.title == "浜哄伐鏅鸿兘鎶€鏈熀纭€":
+            changed = (
+                _ensure_course_activity(
+                    db,
+                    course=course,
+                    position=1,
+                    title="课堂热身与观察说明",
+                    activity_type=CourseActivityType.RICH_TEXT,
+                    summary="先读任务背景，再进入数据观察。",
+                    instructions_html="<p>先阅读任务背景，明确本节课的观察目标和数据采集方式。</p>",
+                )
+                or changed
+            )
+            changed = (
+                _ensure_course_activity(
+                    db,
+                    course=course,
+                    position=2,
+                    title="图表整理与结论撰写",
+                    activity_type=CourseActivityType.RICH_TEXT,
+                    summary="将数据整理成图表，并完成书面结论。",
+                    instructions_html="<p>把采集结果整理为图表，并写出至少两条基于数据的结论。</p>",
+                )
+                or changed
+            )
+        elif course.title == "缃戦〉璁捐鍏ラ棬":
+            changed = (
+                _ensure_course_activity(
+                    db,
+                    course=course,
+                    position=1,
+                    title="信息卡片结构设计",
+                    activity_type=CourseActivityType.RICH_TEXT,
+                    summary="先梳理页面信息层级。",
+                    instructions_html="<p>确定标题、主图、描述和行动按钮的层级，再开始布局。</p>",
+                )
+                or changed
+            )
+            changed = (
+                _ensure_course_activity(
+                    db,
+                    course=course,
+                    position=2,
+                    title="交互网页任务",
+                    activity_type=CourseActivityType.INTERACTIVE_PAGE,
+                    summary="教师可上传 HTML/ZIP 作为交互网页任务。",
+                    instructions_html="<p>上传交互网页后，学生可以在作业详情页直接打开并提交 JSON 数据。</p>",
                 )
                 or changed
             )
@@ -942,7 +1208,7 @@ def seed_demo_data(db: Session) -> None:
         assignment_title="课堂图表作品提交",
         assignment_prompt="请根据课堂采集到的数据，整理一份图表作品，并说明你从数据中观察到的规律。",
         is_published=True,
-        published_at=datetime.utcnow() - timedelta(days=10),
+        published_at=utc_now() - timedelta(days=10),
     )
     course_web = Course(
         school_id=school_a.id,
@@ -952,7 +1218,7 @@ def seed_demo_data(db: Session) -> None:
         assignment_title="信息卡片页面草稿",
         assignment_prompt="完成一个包含标题、图片区和说明文字的信息卡片页面，并保存为课堂草稿。",
         is_published=True,
-        published_at=datetime.utcnow() - timedelta(days=8),
+        published_at=utc_now() - timedelta(days=8),
     )
     db.add_all([course_ai, course_web])
     db.flush()
@@ -966,12 +1232,12 @@ def seed_demo_data(db: Session) -> None:
         stage=course_ai.stage_label,
         status="active",
         expected_students=len(students),
-        started_at=datetime.utcnow() - timedelta(minutes=18),
+        started_at=utc_now() - timedelta(minutes=18),
     )
     db.add(session)
     db.flush()
 
-    now = datetime.utcnow()
+    now = utc_now()
     presence_rows = [
         PresenceState(
             school_id=school_a.id,

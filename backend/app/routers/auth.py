@@ -6,6 +6,7 @@ from ..core.auth import (
     build_session,
     get_current_principal,
     principal_to_session_info,
+    revoke_session,
     verify_password,
 )
 from ..core.database import get_db
@@ -14,6 +15,7 @@ from ..schemas import (
     BootstrapResponse,
     LoginRequest,
     LoginResponse,
+    MessageResponse,
     SessionInfo,
     ThemeStyleOption,
 )
@@ -51,7 +53,7 @@ def _redirect_path_for_role(role: UserRole) -> str:
     if role == UserRole.STUDENT:
         return "/student/home"
     if role in (UserRole.TEACHER, UserRole.SCHOOL_ADMIN, UserRole.PLATFORM_ADMIN):
-        return "/teacher/console"
+        return "/teacher/dashboard"
     return "/"
 
 
@@ -90,3 +92,9 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> LoginResponse
 @router.get("/me", response_model=SessionInfo)
 def me(principal=Depends(get_current_principal)) -> SessionInfo:
     return principal_to_session_info(principal)
+
+
+@router.post("/logout", response_model=MessageResponse)
+def logout(principal=Depends(get_current_principal)) -> MessageResponse:
+    revoke_session(principal.token)
+    return MessageResponse(message="Signed out successfully.")

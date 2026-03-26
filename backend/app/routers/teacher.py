@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -10,15 +11,25 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..core.auth import Principal, require_roles
+from ..core.clock import utc_now
 from ..core.database import SessionLocal, get_db
-from ..core.resource_storage import resolve_resource_path, save_uploaded_resource
+from ..core.resource_storage import (
+    resolve_resource_path,
+    save_uploaded_interactive_package,
+    save_uploaded_resource,
+)
 from ..models import (
+    ActivitySubmission,
     AISuggestionDraft,
+    AuditLog,
+    AuditLogLevel,
     AttendanceRecord,
     AttendanceStatus,
     ClassSession,
     Classroom,
     Course,
+    CourseActivity,
+    CourseActivityType,
     HelpRequest,
     LearningResource,
     PresenceState,
@@ -37,14 +48,21 @@ from ..models import (
     UserRole,
 )
 from ..schemas import (
+    ActivitySubmissionSummary,
     AttendanceMarkRequest,
     AttendanceRecordSummary,
+    CourseActivitySummary,
     CreateDraftRequest,
     CreateDraftResponse,
     MessageResponse,
     RadarSummary,
+    TeacherAttendanceResponse,
+    TeacherCopilotResponse,
+    TeacherCourseCollectionResponse,
+    TeacherCourseDetailResponse,
     TeacherCourseSaveRequest,
     TeacherCourseSummary,
+    TeacherDashboardResponse,
     StartSessionRequest,
     SubmissionHistoryEntry,
     SubmissionQueueItem,
@@ -54,6 +72,7 @@ from ..schemas import (
     TeacherClassroomSummary,
     TeacherConsoleResponse,
     TeacherDraft,
+    TeacherDraftUpdateRequest,
     TeacherHelpRequestSummary,
     TeacherLaunchOption,
     ResourceCategorySummary,
@@ -62,8 +81,10 @@ from ..schemas import (
     TeacherReflectionDraftResponse,
     TeacherReflectionRequest,
     TeacherReflectionSummary,
+    TeacherResourcesResponse,
     TeacherSessionAnalytics,
     TeacherStudentRosterEntry,
+    TeacherSubmissionsResponse,
     TeacherSubmissionDetail,
     TodoItem,
 )
@@ -71,6 +92,8 @@ from ..schemas import (
 router = APIRouter(prefix="/teacher", tags=["teacher"])
 
 ALLOWED_ROLES = (UserRole.TEACHER, UserRole.SCHOOL_ADMIN, UserRole.PLATFORM_ADMIN)
+AI_DRAFT_PROVIDER = "learnsite-local-copilot"
+AI_DRAFT_MODEL = "learnsite-local-copilot-v1"
 
 
 def _format_hm(value: datetime | None) -> str | None:
@@ -91,6 +114,18 @@ def _format_file_size(file_size: int) -> str:
     if file_size < 1024 * 1024:
         return f"{round(file_size / 1024, 1)} KB"
     return f"{round(file_size / (1024 * 1024), 1)} MB"
+
+
+def _build_public_activity_launch_url(activity: CourseActivity) -> str | None:
+    if not activity.interactive_launch_key or not activity.interactive_entry_file:
+        return None
+    return f"/api/public/activities/{activity.interactive_launch_key}/{activity.interactive_entry_file}"
+
+
+def _build_public_activity_submission_url(activity: CourseActivity) -> str | None:
+    if not activity.interactive_submission_key:
+        return None
+    return f"/api/public/activities/{activity.interactive_submission_key}/submit"
 
 
 def _shorten(text: str, *, limit: int = 96) -> str:
@@ -125,6 +160,47 @@ def _resolve_operator(db: Session, principal: Principal) -> User:
     if operator is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Operator not found.")
     return operator
+
+
+def _append_teacher_audit_log(
+    db: Session,
+    principal: Principal,
+    *,
+    action: str,
+    target_label: str,
+    summary: str,
+    detail: str | None = None,
+    target_id: str | None = None,
+    level: AuditLogLevel = AuditLogLevel.INFO,
+) -> None:
+    db.add(
+        AuditLog(
+            school_id=principal.school_id,
+            actor_user_id=principal.user_id,
+            actor_username=principal.username,
+            actor_display_name=principal.display_name,
+            actor_role=principal.role,
+            action=action,
+            target_type="ai_draft",
+            target_id=target_id,
+            target_label=target_label,
+            level=level,
+            summary=summary,
+            detail=detail,
+        )
+    )
+
+
+def _build_ai_draft_audit_detail(draft: AISuggestionDraft, extra: str | None = None) -> str:
+    parts = [
+        f"provider={AI_DRAFT_PROVIDER}",
+        f"model={AI_DRAFT_MODEL}",
+        f"session_id={draft.session_id}",
+        f"draft_type={draft.draft_type}",
+    ]
+    if extra:
+        parts.append(extra)
+    return "; ".join(parts)
 
 
 def _get_accessible_classroom_ids(db: Session, principal: Principal, operator: User) -> list[int]:
@@ -226,6 +302,18 @@ def _get_course(db: Session, principal: Principal, course_id: int) -> Course:
     return course
 
 
+def _get_course_activity(db: Session, principal: Principal, activity_id: int) -> CourseActivity:
+    activity = db.scalar(
+        select(CourseActivity).where(
+            CourseActivity.id == activity_id,
+            CourseActivity.school_id == principal.school_id,
+        )
+    )
+    if activity is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course activity not found.")
+    return activity
+
+
 def _get_classroom(db: Session, principal: Principal, classroom_id: int) -> Classroom:
     classroom = db.scalar(
         select(Classroom).where(
@@ -236,6 +324,115 @@ def _get_classroom(db: Session, principal: Principal, classroom_id: int) -> Clas
     if classroom is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Classroom not found.")
     return classroom
+
+
+def _get_class_session(db: Session, principal: Principal, session_id: int) -> ClassSession:
+    session_obj = db.scalar(
+        select(ClassSession).where(
+            ClassSession.id == session_id,
+            ClassSession.school_id == principal.school_id,
+        )
+    )
+    if session_obj is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Class session not found.")
+    return session_obj
+
+
+def _default_course_activity_payload(course: Course) -> CourseActivity:
+    return CourseActivity(
+        school_id=course.school_id,
+        course_id=course.id,
+        title=course.assignment_title,
+        activity_type=CourseActivityType.RICH_TEXT,
+        position=1,
+        summary="Default activity generated from the assignment prompt.",
+        instructions_html=course.assignment_prompt,
+    )
+
+
+def _resequence_course_activities(db: Session, ordered_activities: list[CourseActivity]) -> None:
+    if not ordered_activities:
+        return
+
+    temporary_base = 1000 + len(ordered_activities)
+    for offset, activity in enumerate(ordered_activities, start=1):
+        activity.position = temporary_base + offset
+    db.flush()
+
+    for position, activity in enumerate(ordered_activities, start=1):
+        activity.position = position
+    db.flush()
+
+
+def _sync_course_activities(db: Session, course: Course, payload: TeacherCourseSaveRequest) -> None:
+    payload_items = payload.activities or []
+    if not payload_items:
+        if course.activities:
+            _resequence_course_activities(db, sorted(course.activities, key=lambda item: item.position))
+            return
+        default_activity = _default_course_activity_payload(course)
+        default_activity.interactive_launch_key = None
+        default_activity.interactive_submission_key = None
+        db.add(default_activity)
+        db.flush()
+        return
+
+    existing_by_id = {activity.id: activity for activity in course.activities}
+    requested_existing_ids: set[int] = set()
+    ordered_activities: list[CourseActivity] = []
+    temporary_base = 1000 + len(existing_by_id) + len(payload_items)
+
+    for offset, activity_payload in enumerate(payload_items, start=1):
+        activity = None
+        if activity_payload.id is not None:
+            if activity_payload.id in requested_existing_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Course activity {activity_payload.id} is duplicated in the payload.",
+                )
+            activity = existing_by_id.get(activity_payload.id)
+            if activity is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Course activity {activity_payload.id} not found for this course.",
+                )
+            requested_existing_ids.add(activity_payload.id)
+        else:
+            activity = CourseActivity(
+                school_id=course.school_id,
+                course_id=course.id,
+                activity_type=activity_payload.activity_type,
+            )
+            db.add(activity)
+
+        activity.title = activity_payload.title.strip()
+        activity.activity_type = activity_payload.activity_type
+        activity.position = temporary_base + offset
+        activity.summary = activity_payload.summary.strip() if activity_payload.summary else None
+        activity.instructions_html = activity_payload.instructions_html.strip()
+
+        if activity.activity_type == CourseActivityType.INTERACTIVE_PAGE:
+            activity.interactive_launch_key = activity.interactive_launch_key or secrets.token_urlsafe(18)
+            activity.interactive_submission_key = activity.interactive_submission_key or secrets.token_urlsafe(24)
+        else:
+            activity.interactive_storage_key = None
+            activity.interactive_entry_file = None
+            activity.interactive_asset_name = None
+            activity.interactive_launch_key = None
+            activity.interactive_submission_key = None
+
+        ordered_activities.append(activity)
+
+    for activity in existing_by_id.values():
+        if activity.id not in requested_existing_ids:
+            db.delete(activity)
+
+    db.flush()
+
+    for position, activity in enumerate(ordered_activities, start=1):
+        activity.position = position
+
+    db.flush()
 
 
 def _ensure_teacher_session_access(db: Session, principal: Principal, operator: User, session_id: int) -> None:
@@ -259,9 +456,46 @@ def _ensure_teacher_submission_access(db: Session, principal: Principal, operato
     _ensure_teacher_session_access(db, principal, operator, submission.session_id)
 
 
+def _get_ai_draft(
+    db: Session,
+    principal: Principal,
+    operator: User,
+    draft_id: int,
+) -> AISuggestionDraft:
+    draft = db.scalar(
+        select(AISuggestionDraft).where(
+            AISuggestionDraft.id == draft_id,
+            AISuggestionDraft.school_id == principal.school_id,
+            AISuggestionDraft.teacher_id == operator.id,
+        )
+    )
+    if draft is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="AI draft not found.")
+    _ensure_teacher_session_access(db, principal, operator, draft.session_id)
+    return draft
+
+
+def _ensure_draft_editable(draft: AISuggestionDraft) -> None:
+    if draft.status != "draft":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only drafts in draft status can still be changed.",
+        )
+
+
+def _normalize_teacher_draft_update(payload: TeacherDraftUpdateRequest) -> tuple[str, str]:
+    title = payload.title.strip()
+    content = payload.content.strip()
+    if not title:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Draft title is required.")
+    if not content:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Draft content is required.")
+    return title, content
+
+
 def _build_radar_summary(db: Session, session_obj: ClassSession) -> RadarSummary:
     rows = db.scalars(select(PresenceState).where(PresenceState.session_id == session_obj.id)).all()
-    now = datetime.utcnow()
+    now = utc_now()
     absent = 0
     idle = 0
     not_started = 0
@@ -296,6 +530,7 @@ def _serialize_draft(draft: AISuggestionDraft) -> TeacherDraft:
         title=draft.title,
         content=draft.content,
         created_at=_format_full(draft.created_at),
+        updated_at=_format_full(draft.updated_at) if draft.updated_at else None,
         status=draft.status,
     )
 
@@ -308,8 +543,49 @@ def _serialize_course(course: Course) -> TeacherCourseSummary:
         overview=course.overview,
         assignment_title=course.assignment_title,
         assignment_prompt=course.assignment_prompt,
+        activity_count=len(course.activities),
         is_published=course.is_published,
         published_at=_format_full(course.published_at) if course.published_at else None,
+    )
+
+
+def _serialize_activity_submission(submission: ActivitySubmission) -> ActivitySubmissionSummary:
+    return ActivitySubmissionSummary(
+        id=submission.id,
+        submitted_by_name=submission.submitted_by_name,
+        submitted_at=_format_full(submission.created_at),
+        payload_preview=_shorten(submission.payload_json, limit=140),
+    )
+
+
+def _serialize_course_activity(activity: CourseActivity) -> CourseActivitySummary:
+    recent_submissions = sorted(activity.submissions, key=lambda item: item.created_at, reverse=True)
+    latest_submission = recent_submissions[0] if recent_submissions else None
+
+    return CourseActivitySummary(
+        id=activity.id,
+        title=activity.title,
+        activity_type=activity.activity_type,
+        position=activity.position,
+        summary=activity.summary,
+        instructions_html=activity.instructions_html or "",
+        has_interactive_asset=bool(activity.interactive_storage_key and activity.interactive_entry_file),
+        interactive_asset_name=activity.interactive_asset_name,
+        interactive_launch_url=_build_public_activity_launch_url(activity),
+        interactive_preview_url=_build_public_activity_launch_url(activity),
+        interactive_submission_api_url=_build_public_activity_submission_url(activity),
+        submission_count=len(recent_submissions),
+        last_submitted_at=_format_full(latest_submission.created_at) if latest_submission else None,
+        latest_submission=_serialize_activity_submission(latest_submission) if latest_submission else None,
+        recent_submissions=[_serialize_activity_submission(item) for item in recent_submissions[:5]],
+    )
+
+
+def _serialize_course_detail(course: Course) -> TeacherCourseDetailResponse:
+    activities = sorted(course.activities, key=lambda item: item.position)
+    return TeacherCourseDetailResponse(
+        course=_serialize_course(course),
+        activities=[_serialize_course_activity(activity) for activity in activities],
     )
 
 
@@ -1136,6 +1412,178 @@ def _build_console_response(db: Session, principal: Principal, operator: User) -
     )
 
 
+def _build_dashboard_response(db: Session, principal: Principal, operator: User) -> TeacherDashboardResponse:
+    console = _build_console_response(db, principal, operator)
+    return TeacherDashboardResponse(
+        session_id=console.session_id,
+        school_name=console.school_name,
+        teacher_name=console.teacher_name,
+        class_name=console.class_name,
+        lesson_title=console.lesson_title,
+        assignment_title=console.assignment_title,
+        session_status=console.session_status,
+        radar=console.radar,
+        workbench_steps=console.workbench_steps,
+        launch_options=console.launch_options,
+        managed_classrooms=console.managed_classrooms,
+        analytics=console.analytics,
+        student_roster_scope=console.student_roster_scope,
+        student_roster_live=console.student_roster_live,
+        student_roster=console.student_roster,
+    )
+
+
+def _build_attendance_response_from_session(
+    db: Session,
+    principal: Principal,
+    operator: User,
+    session_obj: ClassSession | None,
+) -> TeacherAttendanceResponse:
+    accessible_classroom_ids = _get_accessible_classroom_ids(db, principal, operator)
+    if session_obj is None:
+        return TeacherAttendanceResponse(
+            session_id=None,
+            school_name=principal.school_name,
+            teacher_name=operator.display_name,
+            class_name="Awaiting session",
+            lesson_title="No active course",
+            session_status="idle",
+            radar=RadarSummary(online=0, expected=0, absent=0, idle=0, not_started=0, help_requests=0),
+            analytics=_empty_analytics(),
+            student_roster_scope="No live roster",
+            student_roster_live=False,
+            student_roster=[],
+            attendance_records=[],
+            help_requests=[],
+        )
+
+    course = db.get(Course, session_obj.course_id)
+    classroom = db.get(Classroom, session_obj.classroom_id)
+    if course is None or classroom is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Teaching context is incomplete.")
+    student_roster_scope, student_roster_live, student_roster = _build_student_roster(
+        db,
+        principal,
+        accessible_classroom_ids,
+        session_obj,
+    )
+    return TeacherAttendanceResponse(
+        session_id=session_obj.id,
+        school_name=principal.school_name,
+        teacher_name=operator.display_name,
+        class_name=classroom.name,
+        lesson_title=course.title,
+        session_status=session_obj.status,
+        radar=_build_radar_summary(db, session_obj),
+        analytics=_build_session_analytics(db, session_obj),
+        student_roster_scope=student_roster_scope,
+        student_roster_live=student_roster_live,
+        student_roster=student_roster,
+        attendance_records=_serialize_attendance(db, session_obj),
+        help_requests=_serialize_help_requests(db, session_obj),
+    )
+
+
+def _build_submissions_response(db: Session, principal: Principal, operator: User) -> TeacherSubmissionsResponse:
+    current_session = _find_current_session(db, principal, operator)
+    if current_session is None:
+        return TeacherSubmissionsResponse(
+            session_id=None,
+            school_name=principal.school_name,
+            teacher_name=operator.display_name,
+            class_name="Awaiting session",
+            lesson_title="No active course",
+            assignment_title="No active assignment",
+            session_status="idle",
+            submissions=[],
+            analytics=_empty_analytics(),
+        )
+
+    session_obj, course, classroom = current_session
+    return TeacherSubmissionsResponse(
+        session_id=session_obj.id,
+        school_name=principal.school_name,
+        teacher_name=operator.display_name,
+        class_name=classroom.name,
+        lesson_title=course.title,
+        assignment_title=course.assignment_title,
+        session_status=session_obj.status,
+        submissions=_serialize_submissions(db, session_obj),
+        analytics=_build_session_analytics(db, session_obj),
+    )
+
+
+def _build_copilot_response(db: Session, principal: Principal, operator: User) -> TeacherCopilotResponse:
+    current_session = _find_current_session(db, principal, operator)
+    if current_session is None:
+        return TeacherCopilotResponse(
+            session_id=None,
+            school_name=principal.school_name,
+            teacher_name=operator.display_name,
+            class_name="Awaiting session",
+            lesson_title="No active course",
+            session_status="idle",
+            reflection=TeacherReflectionSummary(),
+            analytics=_empty_analytics(),
+            ai_drafts=[],
+        )
+
+    session_obj, course, classroom = current_session
+    drafts = db.scalars(
+        select(AISuggestionDraft)
+        .where(AISuggestionDraft.teacher_id == operator.id, AISuggestionDraft.session_id == session_obj.id)
+        .order_by(AISuggestionDraft.created_at.desc())
+    ).all()
+    return TeacherCopilotResponse(
+        session_id=session_obj.id,
+        school_name=principal.school_name,
+        teacher_name=operator.display_name,
+        class_name=classroom.name,
+        lesson_title=course.title,
+        session_status=session_obj.status,
+        reflection=_serialize_reflection(_get_session_reflection(db, session_obj.id, operator.id)),
+        analytics=_build_session_analytics(db, session_obj),
+        ai_drafts=[_serialize_draft(draft) for draft in drafts],
+    )
+
+
+def _build_resources_response(db: Session, principal: Principal, operator: User) -> TeacherResourcesResponse:
+    accessible_classroom_ids = _get_accessible_classroom_ids(db, principal, operator)
+    return TeacherResourcesResponse(
+        school_name=principal.school_name,
+        teacher_name=operator.display_name,
+        managed_classrooms=_list_managed_classrooms(db, principal, accessible_classroom_ids),
+        resource_categories=_list_resource_categories(db, principal.school_id, active_only=False),
+        resources=_list_teacher_resources(db, principal, operator, accessible_classroom_ids),
+    )
+
+
+def _build_course_collection_response(
+    db: Session,
+    principal: Principal,
+    operator: User,
+    *,
+    selected_course_id: int | None = None,
+) -> TeacherCourseCollectionResponse:
+    accessible_classroom_ids = _get_accessible_classroom_ids(db, principal, operator)
+    courses = db.scalars(select(Course).where(Course.school_id == principal.school_id).order_by(Course.updated_at.desc())).all()
+    selected_course = None
+    if selected_course_id is not None:
+        selected_course_model = _get_course(db, principal, selected_course_id)
+        selected_course = _serialize_course_detail(selected_course_model)
+    elif courses:
+        selected_course = _serialize_course_detail(courses[0])
+
+    return TeacherCourseCollectionResponse(
+        school_name=principal.school_name,
+        teacher_name=operator.display_name,
+        managed_classrooms=_list_managed_classrooms(db, principal, accessible_classroom_ids),
+        launch_options=_list_launch_options(db, principal.school_id, accessible_classroom_ids),
+        courses=[_serialize_course(course) for course in courses],
+        selected_course=selected_course,
+    )
+
+
 def _resolve_help_requests(db: Session, submission: Submission) -> None:
     help_requests = db.scalars(
         select(HelpRequest).where(
@@ -1166,6 +1614,85 @@ def teacher_console(
     return _build_console_response(db, principal, operator)
 
 
+@router.get("/dashboard", response_model=TeacherDashboardResponse)
+def teacher_dashboard(
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherDashboardResponse:
+    operator = _resolve_operator(db, principal)
+    return _build_dashboard_response(db, principal, operator)
+
+
+@router.get("/attendance", response_model=TeacherAttendanceResponse)
+def teacher_attendance_overview(
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherAttendanceResponse:
+    operator = _resolve_operator(db, principal)
+    current_session = _find_current_session(db, principal, operator)
+    session_obj = current_session[0] if current_session else None
+    return _build_attendance_response_from_session(db, principal, operator, session_obj)
+
+
+@router.get("/attendance/sessions/{session_id}", response_model=TeacherAttendanceResponse)
+def teacher_attendance_session_detail(
+    session_id: int,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherAttendanceResponse:
+    operator = _resolve_operator(db, principal)
+    session_obj = _get_class_session(db, principal, session_id)
+    _ensure_teacher_session_access(db, principal, operator, session_obj.id)
+    return _build_attendance_response_from_session(db, principal, operator, session_obj)
+
+
+@router.get("/submissions", response_model=TeacherSubmissionsResponse)
+def teacher_submissions_overview(
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherSubmissionsResponse:
+    operator = _resolve_operator(db, principal)
+    return _build_submissions_response(db, principal, operator)
+
+
+@router.get("/courses", response_model=TeacherCourseCollectionResponse)
+def teacher_courses(
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherCourseCollectionResponse:
+    operator = _resolve_operator(db, principal)
+    return _build_course_collection_response(db, principal, operator)
+
+
+@router.get("/courses/{course_id}", response_model=TeacherCourseDetailResponse)
+def teacher_course_detail(
+    course_id: int,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherCourseDetailResponse:
+    _resolve_operator(db, principal)
+    course = _get_course(db, principal, course_id)
+    return _serialize_course_detail(course)
+
+
+@router.get("/copilot", response_model=TeacherCopilotResponse)
+def teacher_copilot(
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherCopilotResponse:
+    operator = _resolve_operator(db, principal)
+    return _build_copilot_response(db, principal, operator)
+
+
+@router.get("/resources/overview", response_model=TeacherResourcesResponse)
+def teacher_resources_overview(
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherResourcesResponse:
+    operator = _resolve_operator(db, principal)
+    return _build_resources_response(db, principal, operator)
+
+
 @router.get("/submissions/{submission_id}", response_model=TeacherSubmissionDetail)
 def teacher_submission_detail(
     submission_id: int,
@@ -1191,7 +1718,7 @@ def review_submission(
     if submission.status == SubmissionStatus.DRAFT:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft submission cannot be reviewed yet.")
 
-    now = datetime.utcnow()
+    now = utc_now()
     submission.status = SubmissionStatus.REVIEWED
     submission.teacher_feedback = payload.feedback
     submission.review_decision = payload.decision
@@ -1256,6 +1783,19 @@ def create_feedback_draft(
         status="draft",
     )
     db.add(draft)
+    db.flush()
+    _append_teacher_audit_log(
+        db,
+        principal,
+        action="teacher_ai_draft_created",
+        target_label=draft.title,
+        target_id=str(draft.id),
+        summary=f"Created AI draft: {draft.title}",
+        detail=_build_ai_draft_audit_detail(
+            draft,
+            f"submission_id={submission.id}; student_username={student.username}",
+        ),
+    )
     db.commit()
     db.refresh(draft)
     return CreateDraftResponse(draft=_serialize_draft(draft))
@@ -1281,15 +1821,17 @@ def save_course(
             is_published=False,
         )
         db.add(course)
+        db.flush()
 
     course.title = payload.title.strip()
     course.stage_label = payload.stage_label.strip()
     course.overview = payload.overview.strip() if payload.overview else None
     course.assignment_title = payload.assignment_title.strip()
     course.assignment_prompt = payload.assignment_prompt.strip()
+    _sync_course_activities(db, course, payload)
     if payload.publish_now:
         course.is_published = True
-        course.published_at = datetime.utcnow()
+        course.published_at = utc_now()
 
     db.commit()
     db.refresh(course)
@@ -1305,7 +1847,7 @@ def publish_course(
     _resolve_operator(db, principal)
     course = _get_course(db, principal, course_id)
     course.is_published = True
-    course.published_at = datetime.utcnow()
+    course.published_at = utc_now()
     db.commit()
     db.refresh(course)
     return _serialize_course(course)
@@ -1323,6 +1865,38 @@ def unpublish_course(
     db.commit()
     db.refresh(course)
     return _serialize_course(course)
+
+
+@router.post("/activities/{activity_id}/interactive-upload", response_model=CourseActivitySummary)
+async def upload_interactive_activity_asset(
+    activity_id: int,
+    upload: UploadFile = File(...),
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> CourseActivitySummary:
+    _resolve_operator(db, principal)
+    activity = _get_course_activity(db, principal, activity_id)
+    if activity.activity_type != CourseActivityType.INTERACTIVE_PAGE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only interactive page activities can accept HTML or ZIP uploads.",
+        )
+    if not upload.filename:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Upload file is required.")
+
+    try:
+        storage_key, entry_file, asset_name, _ = await save_uploaded_interactive_package(upload, principal.school_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+    activity.interactive_storage_key = storage_key
+    activity.interactive_entry_file = entry_file
+    activity.interactive_asset_name = asset_name
+    activity.interactive_launch_key = activity.interactive_launch_key or secrets.token_urlsafe(18)
+    activity.interactive_submission_key = activity.interactive_submission_key or secrets.token_urlsafe(24)
+    db.commit()
+    db.refresh(activity)
+    return _serialize_course_activity(activity)
 
 
 @router.post("/resources", response_model=TeacherResourceSummary)
@@ -1482,6 +2056,19 @@ def create_reflection_draft(
         status="draft",
     )
     db.add(draft)
+    db.flush()
+    _append_teacher_audit_log(
+        db,
+        principal,
+        action="teacher_ai_draft_created",
+        target_label=draft.title,
+        target_id=str(draft.id),
+        summary=f"Created AI draft: {draft.title}",
+        detail=_build_ai_draft_audit_detail(
+            draft,
+            f"course_id={course.id}; classroom_id={classroom.id}",
+        ),
+    )
     db.commit()
     db.refresh(draft)
     return TeacherReflectionDraftResponse(
@@ -1545,7 +2132,7 @@ def start_session(
         stage=course.stage_label,
         status="active",
         expected_students=len(students),
-        started_at=datetime.utcnow(),
+        started_at=utc_now(),
     )
     db.add(session_obj)
     db.flush()
@@ -1567,7 +2154,7 @@ def start_session(
                 status=PresenceStatus.NOT_STARTED,
                 task_progress=0,
                 help_requested=False,
-                last_seen_at=datetime.utcnow(),
+                last_seen_at=utc_now(),
             )
         )
 
@@ -1593,7 +2180,7 @@ def mark_attendance(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attendance record not found.")
     _ensure_teacher_session_access(db, principal, operator, attendance.session_id)
 
-    now = datetime.utcnow()
+    now = utc_now()
     attendance.status = payload.status
     attendance.note = payload.note
     attendance.marked_at = now
@@ -1653,6 +2240,99 @@ def create_ai_draft(
         status="draft",
     )
     db.add(draft)
+    db.flush()
+    _append_teacher_audit_log(
+        db,
+        principal,
+        action="teacher_ai_draft_created",
+        target_label=draft.title,
+        target_id=str(draft.id),
+        summary=f"Created AI draft: {draft.title}",
+        detail=_build_ai_draft_audit_detail(
+            draft,
+            f"goal={_shorten(payload.goal.strip(), limit=120)}; course_id={course.id}; classroom_id={classroom.id}",
+        ),
+    )
     db.commit()
     db.refresh(draft)
     return CreateDraftResponse(draft=_serialize_draft(draft))
+
+
+@router.post("/ai/drafts/{draft_id}/save", response_model=TeacherDraft)
+def save_ai_draft(
+    draft_id: int,
+    payload: TeacherDraftUpdateRequest,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherDraft:
+    operator = _resolve_operator(db, principal)
+    draft = _get_ai_draft(db, principal, operator, draft_id)
+    _ensure_draft_editable(draft)
+    title, content = _normalize_teacher_draft_update(payload)
+    draft.title = title
+    draft.content = content
+    _append_teacher_audit_log(
+        db,
+        principal,
+        action="teacher_ai_draft_updated",
+        target_label=draft.title,
+        target_id=str(draft.id),
+        summary=f"Updated AI draft: {draft.title}",
+        detail=_build_ai_draft_audit_detail(draft, "status=draft"),
+    )
+    db.commit()
+    db.refresh(draft)
+    return _serialize_draft(draft)
+
+
+@router.post("/ai/drafts/{draft_id}/accept", response_model=TeacherDraft)
+def accept_ai_draft(
+    draft_id: int,
+    payload: TeacherDraftUpdateRequest,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherDraft:
+    operator = _resolve_operator(db, principal)
+    draft = _get_ai_draft(db, principal, operator, draft_id)
+    _ensure_draft_editable(draft)
+    title, content = _normalize_teacher_draft_update(payload)
+    draft.title = title
+    draft.content = content
+    draft.status = "accepted"
+    _append_teacher_audit_log(
+        db,
+        principal,
+        action="teacher_ai_draft_accepted",
+        target_label=draft.title,
+        target_id=str(draft.id),
+        summary=f"Accepted AI draft: {draft.title}",
+        detail=_build_ai_draft_audit_detail(draft, "status=accepted"),
+    )
+    db.commit()
+    db.refresh(draft)
+    return _serialize_draft(draft)
+
+
+@router.post("/ai/drafts/{draft_id}/reject", response_model=TeacherDraft)
+def reject_ai_draft(
+    draft_id: int,
+    principal: Principal = Depends(require_roles(*ALLOWED_ROLES)),
+    db: Session = Depends(get_db),
+) -> TeacherDraft:
+    operator = _resolve_operator(db, principal)
+    draft = _get_ai_draft(db, principal, operator, draft_id)
+    _ensure_draft_editable(draft)
+    draft.status = "rejected"
+    _append_teacher_audit_log(
+        db,
+        principal,
+        action="teacher_ai_draft_rejected",
+        target_label=draft.title,
+        target_id=str(draft.id),
+        summary=f"Rejected AI draft: {draft.title}",
+        detail=_build_ai_draft_audit_detail(draft, "status=rejected"),
+        level=AuditLogLevel.WARNING,
+    )
+    db.commit()
+    db.refresh(draft)
+    return _serialize_draft(draft)

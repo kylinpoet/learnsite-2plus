@@ -6,6 +6,7 @@ from enum import Enum
 from sqlalchemy import Boolean, Date, DateTime, Enum as SqlEnum, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from .core.clock import utc_now
 from .core.database import Base
 
 
@@ -76,12 +77,28 @@ class ResourceAudience(str, Enum):
     ALL = "all"
 
 
+class CourseActivityType(str, Enum):
+    RICH_TEXT = "rich_text"
+    INTERACTIVE_PAGE = "interactive_page"
+
+
+class AuditLogLevel(str, Enum):
+    INFO = "info"
+    WARNING = "warning"
+    RISK = "risk"
+
+
+class BackupSnapshotStatus(str, Enum):
+    READY = "ready"
+    RESTORED = "restored"
+
+
 class TimestampMixin:
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=utc_now,
+        onupdate=utc_now,
     )
 
 
@@ -165,6 +182,39 @@ class Course(Base, TimestampMixin):
     is_published: Mapped[bool] = mapped_column(default=False)
     published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    activities: Mapped[list["CourseActivity"]] = relationship(
+        back_populates="course",
+        order_by="CourseActivity.position",
+        cascade="all, delete-orphan",
+    )
+
+
+class CourseActivity(Base, TimestampMixin):
+    __tablename__ = "course_activities"
+    __table_args__ = (
+        UniqueConstraint("course_id", "position", name="uq_course_activities_course_position"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
+    course_id: Mapped[int] = mapped_column(ForeignKey("courses.id"), index=True)
+    title: Mapped[str] = mapped_column(String(128))
+    activity_type: Mapped[CourseActivityType] = mapped_column(SqlEnum(CourseActivityType), index=True)
+    position: Mapped[int] = mapped_column(Integer, default=1)
+    summary: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    instructions_html: Mapped[str] = mapped_column(Text, default="")
+    interactive_storage_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    interactive_entry_file: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    interactive_asset_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    interactive_launch_key: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+    interactive_submission_key: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+
+    course: Mapped[Course] = relationship(back_populates="activities")
+    submissions: Mapped[list["ActivitySubmission"]] = relationship(
+        back_populates="activity",
+        cascade="all, delete-orphan",
+    )
+
 
 class ResourceCategory(Base, TimestampMixin):
     __tablename__ = "resource_categories"
@@ -197,6 +247,21 @@ class LearningResource(Base, TimestampMixin):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class ActivitySubmission(Base, TimestampMixin):
+    __tablename__ = "activity_submissions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), index=True)
+    course_id: Mapped[int] = mapped_column(ForeignKey("courses.id"), index=True)
+    activity_id: Mapped[int] = mapped_column(ForeignKey("course_activities.id"), index=True)
+    session_id: Mapped[int | None] = mapped_column(ForeignKey("class_sessions.id"), nullable=True, index=True)
+    submitted_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    submitted_by_name: Mapped[str] = mapped_column(String(128))
+    payload_json: Mapped[str] = mapped_column(Text)
+
+    activity: Mapped[CourseActivity] = relationship(back_populates="submissions")
+
+
 class ClassSession(Base, TimestampMixin):
     __tablename__ = "class_sessions"
 
@@ -209,7 +274,7 @@ class ClassSession(Base, TimestampMixin):
     stage: Mapped[str] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(32), default="in_progress")
     expected_students: Mapped[int] = mapped_column(Integer, default=0)
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
 class AttendanceRecord(Base, TimestampMixin):
@@ -240,7 +305,7 @@ class PresenceState(Base, TimestampMixin):
     status: Mapped[PresenceStatus] = mapped_column(SqlEnum(PresenceStatus), default=PresenceStatus.NOT_STARTED)
     task_progress: Mapped[int] = mapped_column(Integer, default=0)
     help_requested: Mapped[bool] = mapped_column(default=False)
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
 class Submission(Base, TimestampMixin):
@@ -278,7 +343,7 @@ class SubmissionRevision(Base):
     title: Mapped[str] = mapped_column(String(128))
     content: Mapped[str] = mapped_column(Text)
     action: Mapped[SubmissionRevisionAction] = mapped_column(SqlEnum(SubmissionRevisionAction))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
     submission: Mapped[Submission] = relationship(back_populates="revisions")
 
@@ -353,6 +418,46 @@ class LegacyIdMapping(Base, TimestampMixin):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
     batch: Mapped[MigrationBatch] = relationship(back_populates="legacy_mappings")
+
+
+class AuditLog(Base, TimestampMixin):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    school_id: Mapped[int | None] = mapped_column(ForeignKey("schools.id"), index=True, nullable=True)
+    actor_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    actor_username: Mapped[str] = mapped_column(String(64))
+    actor_display_name: Mapped[str] = mapped_column(String(64))
+    actor_role: Mapped[UserRole] = mapped_column(SqlEnum(UserRole), index=True)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    target_type: Mapped[str] = mapped_column(String(64))
+    target_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    target_label: Mapped[str] = mapped_column(String(255))
+    level: Mapped[AuditLogLevel] = mapped_column(SqlEnum(AuditLogLevel), index=True, default=AuditLogLevel.INFO)
+    summary: Mapped[str] = mapped_column(String(255))
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class BackupSnapshot(Base, TimestampMixin):
+    __tablename__ = "backup_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    school_id: Mapped[int | None] = mapped_column(ForeignKey("schools.id"), index=True, nullable=True)
+    school_name: Mapped[str] = mapped_column(String(128))
+    actor_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    actor_username: Mapped[str] = mapped_column(String(64))
+    actor_display_name: Mapped[str] = mapped_column(String(64))
+    actor_role: Mapped[UserRole] = mapped_column(SqlEnum(UserRole), index=True)
+    file_name: Mapped[str] = mapped_column(String(255))
+    storage_path: Mapped[str] = mapped_column(String(512), unique=True)
+    file_size: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[BackupSnapshotStatus] = mapped_column(
+        SqlEnum(BackupSnapshotStatus),
+        index=True,
+        default=BackupSnapshotStatus.READY,
+    )
+    note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    restored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class AISuggestionDraft(Base, TimestampMixin):

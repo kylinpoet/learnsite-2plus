@@ -3,14 +3,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 import base64
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import os
 from secrets import token_urlsafe
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, Query, status
+from fastapi import Depends, Header, HTTPException, status
 
+from .config import get_settings
 from ..models import School, ThemeStyle, User, UserRole
 from ..schemas import SessionInfo
 
@@ -26,6 +28,7 @@ class Principal:
     school_code: str
     school_name: str
     theme_style: ThemeStyle
+    expires_at: datetime
 
 
 SESSION_STORE: dict[str, Principal] = {}
@@ -57,6 +60,7 @@ def verify_password(plain_password: str, password_hash: str) -> bool:
 
 
 def build_session(user: User, school: School) -> Principal:
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=get_settings().session_ttl_minutes)
     token = token_urlsafe(32)
     principal = Principal(
         token=token,
@@ -68,6 +72,7 @@ def build_session(user: User, school: School) -> Principal:
         school_code=school.code,
         school_name=school.name,
         theme_style=school.theme_style,
+        expires_at=expires_at,
     )
     SESSION_STORE[token] = principal
     return principal
@@ -82,12 +87,15 @@ def principal_to_session_info(principal: Principal) -> SessionInfo:
         school_code=principal.school_code,
         school_name=principal.school_name,
         theme_style=principal.theme_style,
+        expires_at=principal.expires_at,
     )
 
 
-def _extract_token(authorization: str | None, query_token: str | None) -> str | None:
-    if query_token:
-        return query_token
+def revoke_session(token: str) -> None:
+    SESSION_STORE.pop(token, None)
+
+
+def _extract_token(authorization: str | None) -> str | None:
     if authorization and authorization.startswith("Bearer "):
         return authorization.removeprefix("Bearer ").strip()
     return None
@@ -95,15 +103,21 @@ def _extract_token(authorization: str | None, query_token: str | None) -> str | 
 
 def get_current_principal(
     authorization: Annotated[str | None, Header()] = None,
-    token: Annotated[str | None, Query()] = None,
 ) -> Principal:
-    resolved_token = _extract_token(authorization, token)
+    resolved_token = _extract_token(authorization)
     if not resolved_token or resolved_token not in SESSION_STORE:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing session token.",
         )
-    return SESSION_STORE[resolved_token]
+    principal = SESSION_STORE[resolved_token]
+    if principal.expires_at <= datetime.now(timezone.utc):
+        revoke_session(resolved_token)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired. Please sign in again.",
+        )
+    return principal
 
 
 def require_roles(*allowed_roles: UserRole) -> Callable[[Principal], Principal]:

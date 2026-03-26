@@ -10,6 +10,7 @@ from .core.database import Base, SessionLocal, engine
 from .core.migrations import upgrade_database_schema
 from .routers.admin import router as admin_router
 from .routers.auth import public_router, router as auth_router
+from .routers.public_content import router as public_content_router
 from .routers.student import router as student_router
 from .routers.teacher import router as teacher_router
 from .seed import seed_demo_data
@@ -43,6 +44,7 @@ def healthcheck() -> dict[str, str]:
 
 api_router = APIRouter(prefix=settings.api_prefix)
 api_router.include_router(public_router)
+api_router.include_router(public_content_router)
 api_router.include_router(auth_router)
 api_router.include_router(student_router)
 api_router.include_router(teacher_router)

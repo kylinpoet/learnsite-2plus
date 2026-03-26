@@ -1,12 +1,11 @@
 ﻿<script setup lang="ts">
 import { ElMessage } from 'element-plus'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { apiClient, buildApiUrl } from '../../api/client'
+import { apiClient, buildApiUrl, downloadApiFile } from '../../api/client'
 import type {
   AttendanceRecordSummary,
   AttendanceStatus,
   ResourceAudience,
-  ResourceCategorySummary,
   ReviewDecision,
   StartSessionPayload,
   SubmissionQueueItem,
@@ -17,13 +16,16 @@ import type {
   SubmissionReviewPayload,
   TeacherConsoleResponse,
   TeacherDraft,
+  TeacherDraftUpdatePayload,
   TeacherReflectionSummary,
   TeacherReflectionDraftResponse,
   TeacherReflectionPayload,
   TeacherStudentRosterEntry,
   TeacherSubmissionDetail,
 } from '../../api/types'
+import GovernanceOpsPanel from '../../components/admin/GovernanceOpsPanel.vue'
 import MigrationAdminPanel from '../../components/admin/MigrationAdminPanel.vue'
+import SchoolIdentityPanel from '../../components/admin/SchoolIdentityPanel.vue'
 import MetricCard from '../../components/common/MetricCard.vue'
 import { useSession } from '../../composables/useSession'
 import PortalLayout from '../../layouts/PortalLayout.vue'
@@ -42,6 +44,9 @@ const generatingFeedbackDraft = ref(false)
 const generatingReflectionDraft = ref(false)
 const savingReflection = ref(false)
 const savingLesson = ref(false)
+const savingDraftId = ref<number | null>(null)
+const acceptingDraftId = ref<number | null>(null)
+const rejectingDraftId = ref<number | null>(null)
 const publishingLessonId = ref<number | null>(null)
 const unpublishingLessonId = ref<number | null>(null)
 const uploadingResource = ref(false)
@@ -77,7 +82,6 @@ const teacherResourceQuery = ref('')
 const teacherResourceAudienceFilter = ref<'any' | ResourceAudience>('any')
 const teacherResourceStatusFilter = ref<'all' | 'active' | 'inactive'>('all')
 const teacherResourceCategoryFilter = ref<'any' | number>('any')
-const source = ref<EventSource | null>(null)
 const resourceForm = reactive<{
   title: string
   description: string
@@ -91,6 +95,9 @@ const resourceForm = reactive<{
   category_id: null,
   classroom_id: null,
 })
+const draftEditors = reactive<Record<number, TeacherDraftUpdatePayload>>({})
+let radarAbortController: AbortController | null = null
+let radarReconnectTimer: ReturnType<typeof window.setTimeout> | undefined
 
 const isAdminSession = computed(
   () => sessionState.value?.role === 'school_admin' || sessionState.value?.role === 'platform_admin',
@@ -397,13 +404,13 @@ function captureResourceFile(event: Event) {
   selectedResourceFile.value = target.files?.[0] ?? null
 }
 
-function downloadTeacherResource(resource: TeacherResourceSummary) {
-  const token = sessionState.value?.token
-  if (!token) {
-    return
+async function downloadTeacherResource(resource: TeacherResourceSummary) {
+  try {
+    await downloadApiFile(`/teacher/resources/${resource.id}/download`, resource.original_filename)
+  } catch (requestError) {
+    ElMessage.error('资源下载失败')
+    console.error(requestError)
   }
-  const url = buildApiUrl(`/teacher/resources/${resource.id}/download?token=${encodeURIComponent(token)}`)
-  window.open(url, '_blank', 'noopener')
 }
 
 function openStudentSubmission(entry: TeacherStudentRosterEntry) {
@@ -482,6 +489,64 @@ function syncReflectionForm() {
   reflectionForm.student_support_plan = consoleData.value?.reflection.student_support_plan ?? ''
 }
 
+function syncDraftEditors() {
+  const activeIds = new Set((consoleData.value?.ai_drafts ?? []).map((draft) => draft.id))
+  for (const key of Object.keys(draftEditors)) {
+    const numericId = Number(key)
+    if (!activeIds.has(numericId)) {
+      delete draftEditors[numericId]
+    }
+  }
+
+  for (const draft of consoleData.value?.ai_drafts ?? []) {
+    if (!draftEditors[draft.id]) {
+      draftEditors[draft.id] = {
+        title: draft.title,
+        content: draft.content,
+      }
+    } else if (draft.status !== 'draft') {
+      draftEditors[draft.id].title = draft.title
+      draftEditors[draft.id].content = draft.content
+    }
+  }
+}
+
+function applyDraftUpdate(draft: TeacherDraft) {
+  if (!consoleData.value) {
+    return
+  }
+  const existingIndex = consoleData.value.ai_drafts.findIndex((item) => item.id === draft.id)
+  if (existingIndex === -1) {
+    consoleData.value.ai_drafts.unshift(draft)
+  } else {
+    consoleData.value.ai_drafts.splice(existingIndex, 1, draft)
+  }
+  draftEditors[draft.id] = {
+    title: draft.title,
+    content: draft.content,
+  }
+}
+
+function draftStatusTagType(status: TeacherDraft['status']) {
+  if (status === 'accepted') {
+    return 'success'
+  }
+  if (status === 'rejected') {
+    return 'danger'
+  }
+  return 'info'
+}
+
+function draftStatusLabel(status: TeacherDraft['status']) {
+  if (status === 'accepted') {
+    return '已采纳'
+  }
+  if (status === 'rejected') {
+    return '已驳回'
+  }
+  return '草稿待审'
+}
+
 function syncSelectedLesson(preferredId?: number) {
   if (!lessonPlans.value.length) {
     selectedLessonId.value = null
@@ -507,6 +572,7 @@ async function loadConsole() {
     consoleData.value = data
     loadError.value = ''
     syncReflectionForm()
+    syncDraftEditors()
     syncResourceCategory()
     syncResourceClassroom()
     syncSelectedLesson()
@@ -648,24 +714,81 @@ async function loadSubmissionDetail(submissionId: number) {
   }
 }
 
-function connectRadar() {
+function stopRadar() {
+  if (radarReconnectTimer) {
+    window.clearTimeout(radarReconnectTimer)
+    radarReconnectTimer = undefined
+  }
+  radarAbortController?.abort()
+  radarAbortController = null
+}
+
+async function connectRadar() {
   const token = sessionState.value?.token
   if (!token || !consoleData.value?.session_id || consoleData.value.session_status === 'idle') {
-    source.value?.close()
+    stopRadar()
     return
   }
 
-  source.value?.close()
-  source.value = new EventSource(`${buildApiUrl('/teacher/radar/stream')}?token=${encodeURIComponent(token)}`)
-  source.value.onmessage = (event) => {
-    if (!consoleData.value) {
+  stopRadar()
+  const controller = new AbortController()
+  radarAbortController = controller
+
+  try {
+    const response = await fetch(buildApiUrl('/teacher/radar/stream'), {
+      headers: {
+        Accept: 'text/event-stream',
+        Authorization: `Bearer ${token}`,
+      },
+      signal: controller.signal,
+    })
+
+    if (!response.ok || !response.body) {
+      throw new Error(`Radar stream request failed: ${response.status}`)
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (!controller.signal.aborted) {
+      const { done, value } = await reader.read()
+      if (done) {
+        break
+      }
+
+      buffer += decoder.decode(value, { stream: true })
+      let boundaryIndex = buffer.indexOf('\n\n')
+      while (boundaryIndex !== -1) {
+        const chunk = buffer.slice(0, boundaryIndex)
+        buffer = buffer.slice(boundaryIndex + 2)
+
+        for (const line of chunk.split(/\r?\n/)) {
+          if (!line.startsWith('data:')) {
+            continue
+          }
+          if (!consoleData.value) {
+            continue
+          }
+          consoleData.value.radar = JSON.parse(line.slice(5).trim()) as TeacherConsoleResponse['radar']
+          radarWarning.value = ''
+        }
+
+        boundaryIndex = buffer.indexOf('\n\n')
+      }
+    }
+  } catch (requestError) {
+    if (controller.signal.aborted) {
       return
     }
-    consoleData.value.radar = JSON.parse(event.data) as TeacherConsoleResponse['radar']
-    radarWarning.value = ''
-  }
-  source.value.onerror = () => {
     radarWarning.value = '课堂实时雷达连接中断，请稍后重试。'
+    console.error(requestError)
+  }
+
+  if (!controller.signal.aborted && consoleData.value?.session_status !== 'idle') {
+    radarReconnectTimer = window.setTimeout(() => {
+      void connectRadar()
+    }, 1500)
   }
 }
 
@@ -686,11 +809,12 @@ async function startSession() {
     const { data } = await apiClient.post<TeacherConsoleResponse>('/teacher/session/start', payload)
     consoleData.value = data
     syncReflectionForm()
+    syncDraftEditors()
     syncResourceCategory()
     syncResourceClassroom()
     syncLaunchSelection()
     await syncSelectedSubmission()
-    connectRadar()
+    void connectRadar()
     ElMessage.success('新课次已开始，签到记录已初始化')
   } catch (requestError) {
     ElMessage.error('开课失败')
@@ -719,12 +843,16 @@ async function generateDraft() {
     ElMessage.warning('请先开始一节新课，再生成课堂 AI 草稿')
     return
   }
+  if (!draftGoal.value.trim()) {
+    ElMessage.warning('请先描述你希望 AI 生成什么样的课堂建议')
+    return
+  }
   generating.value = true
   try {
     const { data } = await apiClient.post<{ draft: TeacherDraft }>('/teacher/ai/drafts', {
       goal: draftGoal.value,
     })
-    consoleData.value?.ai_drafts.unshift(data.draft)
+    applyDraftUpdate(data.draft)
     ElMessage.success('AI 课堂建议草稿已生成')
   } catch (requestError) {
     ElMessage.error('AI 草稿生成失败')
@@ -742,7 +870,7 @@ async function generateReflectionDraft() {
   generatingReflectionDraft.value = true
   try {
     const { data } = await apiClient.post<TeacherReflectionDraftResponse>('/teacher/reflection/draft')
-    consoleData.value?.ai_drafts.unshift(data.draft)
+    applyDraftUpdate(data.draft)
     if (consoleData.value) {
       consoleData.value.reflection = data.reflection
     }
@@ -792,7 +920,7 @@ async function generateFeedbackDraft() {
       `/teacher/submissions/${selectedSubmission.value.id}/feedback-draft`,
     )
     reviewForm.feedback = data.draft.content
-    consoleData.value?.ai_drafts.unshift(data.draft)
+    applyDraftUpdate(data.draft)
     ElMessage.success('批改反馈草稿已生成，并已填入右侧表单')
   } catch (requestError) {
     ElMessage.error('反馈草稿生成失败')
@@ -829,13 +957,73 @@ async function submitReview() {
   }
 }
 
+async function saveDraftEdit(draft: TeacherDraft) {
+  const editor = draftEditors[draft.id]
+  if (!editor?.title.trim() || !editor.content.trim()) {
+    ElMessage.warning('请先填写完整的 AI 草稿标题和内容')
+    return
+  }
+
+  savingDraftId.value = draft.id
+  try {
+    const { data } = await apiClient.post<TeacherDraft>(`/teacher/ai/drafts/${draft.id}/save`, {
+      title: editor.title.trim(),
+      content: editor.content.trim(),
+    })
+    applyDraftUpdate(data)
+    ElMessage.success('AI 草稿编辑已保存')
+  } catch (requestError) {
+    ElMessage.error('保存 AI 草稿失败')
+    console.error(requestError)
+  } finally {
+    savingDraftId.value = null
+  }
+}
+
+async function acceptDraft(draft: TeacherDraft) {
+  const editor = draftEditors[draft.id]
+  if (!editor?.title.trim() || !editor.content.trim()) {
+    ElMessage.warning('请先填写完整的 AI 草稿标题和内容')
+    return
+  }
+
+  acceptingDraftId.value = draft.id
+  try {
+    const { data } = await apiClient.post<TeacherDraft>(`/teacher/ai/drafts/${draft.id}/accept`, {
+      title: editor.title.trim(),
+      content: editor.content.trim(),
+    })
+    applyDraftUpdate(data)
+    ElMessage.success('AI 草稿已采纳')
+  } catch (requestError) {
+    ElMessage.error('采纳 AI 草稿失败')
+    console.error(requestError)
+  } finally {
+    acceptingDraftId.value = null
+  }
+}
+
+async function rejectDraft(draft: TeacherDraft) {
+  rejectingDraftId.value = draft.id
+  try {
+    const { data } = await apiClient.post<TeacherDraft>(`/teacher/ai/drafts/${draft.id}/reject`)
+    applyDraftUpdate(data)
+    ElMessage.success('AI 草稿已驳回')
+  } catch (requestError) {
+    ElMessage.error('驳回 AI 草稿失败')
+    console.error(requestError)
+  } finally {
+    rejectingDraftId.value = null
+  }
+}
+
 onMounted(async () => {
   await loadConsole()
-  connectRadar()
+  void connectRadar()
 })
 
 onBeforeUnmount(() => {
-  source.value?.close()
+  stopRadar()
 })
 </script>
 
@@ -1441,17 +1629,65 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="stack">
-            <div
-              v-for="draft in consoleData.ai_drafts"
-              :key="draft.id"
-              class="detail-item"
-              style="display: grid; gap: 10px;"
-            >
-              <div class="status-pill">{{ draft.draft_type }}</div>
-              <strong>{{ draft.title }}</strong>
-              <div class="muted">{{ draft.content }}</div>
-              <div class="mono muted">{{ draft.created_at }} · {{ draft.status }}</div>
+            <div v-if="consoleData.ai_drafts.length === 0" class="empty-state">
+              当前课堂还没有 AI 草稿。你可以生成课堂建议、批改反馈或教学反思草稿。
             </div>
+            <template v-else>
+              <div
+                v-for="draft in consoleData.ai_drafts"
+                :key="draft.id"
+                class="detail-item"
+                style="display: grid; gap: 12px;"
+              >
+                <div class="inline-actions" style="justify-content: flex-start;">
+                  <div class="status-pill">{{ draft.draft_type }}</div>
+                  <el-tag :type="draftStatusTagType(draft.status)">{{ draftStatusLabel(draft.status) }}</el-tag>
+                </div>
+                <el-input
+                  v-model="draftEditors[draft.id].title"
+                  :disabled="draft.status !== 'draft'"
+                  placeholder="AI 草稿标题"
+                />
+                <el-input
+                  v-model="draftEditors[draft.id].content"
+                  type="textarea"
+                  :rows="5"
+                  :disabled="draft.status !== 'draft'"
+                  placeholder="AI 草稿内容"
+                />
+                <div class="inline-actions" style="justify-content: flex-start;">
+                  <el-button
+                    plain
+                    :disabled="draft.status !== 'draft'"
+                    :loading="savingDraftId === draft.id"
+                    @click="saveDraftEdit(draft)"
+                  >
+                    保存编辑
+                  </el-button>
+                  <el-button
+                    type="primary"
+                    :disabled="draft.status !== 'draft'"
+                    :loading="acceptingDraftId === draft.id"
+                    @click="acceptDraft(draft)"
+                  >
+                    采纳草稿
+                  </el-button>
+                  <el-button
+                    type="danger"
+                    plain
+                    :disabled="draft.status !== 'draft'"
+                    :loading="rejectingDraftId === draft.id"
+                    @click="rejectDraft(draft)"
+                  >
+                    驳回草稿
+                  </el-button>
+                </div>
+                <div class="mono muted">
+                  创建于 {{ draft.created_at }}
+                  <template v-if="draft.updated_at"> · 最近更新 {{ draft.updated_at }}</template>
+                </div>
+              </div>
+            </template>
           </div>
         </div>
       </section>
@@ -1631,6 +1867,8 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
+      <SchoolIdentityPanel v-if="isAdminSession" />
+      <GovernanceOpsPanel v-if="isAdminSession" />
       <MigrationAdminPanel v-if="isAdminSession" />
     </div>
 

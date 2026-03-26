@@ -9,9 +9,15 @@ from sqlalchemy.orm import Session
 
 from ..core.auth import hash_password
 from ..core.auth import Principal, require_roles
-from ..core.database import get_db
+from ..core.backup_storage import build_backup_filename, create_sqlite_backup, restore_sqlite_backup
+from ..core.clock import utc_now
+from ..core.database import SessionLocal, engine, get_db
 from ..models import (
     AcademicTerm,
+    AuditLog,
+    AuditLogLevel,
+    BackupSnapshot,
+    BackupSnapshotStatus,
     Classroom,
     LegacyIdMapping,
     MigrationBatch,
@@ -26,16 +32,20 @@ from ..models import (
 from ..schemas import (
     AcademicTermCreateRequest,
     AcademicTermSummary,
+    AdminAuditLogSummary,
     AdminOverviewResponse,
     AdminClassroomSummary,
     AdminStudentSummary,
     AdminTeacherSummary,
+    BackupCreateRequest,
+    BackupSnapshotSummary,
     GovernanceSchoolSnapshot,
     LegacyMappingSummary,
     MessageResponse,
     MigrationBatchSummary,
     MigrationFixRequest,
     MigrationPreviewRow,
+    SchoolSettingsUpdateRequest,
     AdminStudentImportResponse,
     PasswordResetRequest,
     ResourceCategoryCreateRequest,
@@ -57,6 +67,14 @@ def _get_managed_schools(db: Session, principal: Principal) -> list[School]:
     if principal.role == UserRole.PLATFORM_ADMIN:
         return db.scalars(select(School).order_by(School.id)).all()
     return db.scalars(select(School).where(School.id == principal.school_id)).all()
+
+
+def _require_platform_backup_operator(principal: Principal) -> None:
+    if principal.role != UserRole.PLATFORM_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Platform-wide SQLite backup and restore are restricted to platform admins.",
+        )
 
 
 def _resolve_scope_school(db: Session, principal: Principal, school_code: str | None) -> School:
@@ -139,6 +157,18 @@ def _get_classroom(db: Session, school: School, classroom_id: int) -> Classroom:
     return classroom
 
 
+def _get_backup_snapshot(db: Session, school: School, snapshot_id: int) -> BackupSnapshot:
+    snapshot = db.scalar(
+        select(BackupSnapshot).where(
+            BackupSnapshot.id == snapshot_id,
+            BackupSnapshot.school_id == school.id,
+        )
+    )
+    if snapshot is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Backup snapshot not found.")
+    return snapshot
+
+
 def _get_resource_category(db: Session, school: School, category_id: int) -> ResourceCategory:
     category = db.scalar(
         select(ResourceCategory).where(
@@ -167,6 +197,100 @@ def _serialize_resource_categories(db: Session, school: School) -> list[Resource
         )
         for category in categories
     ]
+
+
+def _format_file_size(size: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    value = float(size)
+    unit_index = 0
+    while value >= 1024 and unit_index < len(units) - 1:
+        value /= 1024
+        unit_index += 1
+    return f"{value:.1f} {units[unit_index]}" if unit_index > 0 else f"{int(value)} {units[unit_index]}"
+
+
+def _serialize_backup_snapshots(db: Session, school: School) -> list[BackupSnapshotSummary]:
+    snapshots = db.scalars(
+        select(BackupSnapshot)
+        .where(BackupSnapshot.school_id == school.id)
+        .order_by(BackupSnapshot.created_at.desc(), BackupSnapshot.id.desc())
+        .limit(10)
+    ).all()
+    return [
+        BackupSnapshotSummary(
+            id=snapshot.id,
+            school_id=snapshot.school_id,
+            school_name=snapshot.school_name,
+            actor_display_name=snapshot.actor_display_name,
+            actor_username=snapshot.actor_username,
+            actor_role=snapshot.actor_role,
+            file_name=snapshot.file_name,
+            file_size=snapshot.file_size,
+            file_size_label=_format_file_size(snapshot.file_size),
+            status=snapshot.status,
+            note=snapshot.note,
+            created_at=snapshot.created_at.isoformat(),
+            restored_at=snapshot.restored_at.isoformat() if snapshot.restored_at else None,
+        )
+        for snapshot in snapshots
+    ]
+
+
+def _serialize_recent_audit_logs(db: Session, school: School) -> list[AdminAuditLogSummary]:
+    logs = db.scalars(
+        select(AuditLog)
+        .where(AuditLog.school_id == school.id)
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .limit(16)
+    ).all()
+    return [
+        AdminAuditLogSummary(
+            id=log.id,
+            actor_display_name=log.actor_display_name,
+            actor_username=log.actor_username,
+            actor_role=log.actor_role,
+            action=log.action,
+            target_type=log.target_type,
+            target_id=log.target_id,
+            target_label=log.target_label,
+            level=log.level,
+            summary=log.summary,
+            detail=log.detail,
+            created_at=log.created_at.isoformat(),
+        )
+        for log in logs
+    ]
+
+
+def _append_audit_log(
+    db: Session,
+    principal: Principal,
+    school: School,
+    *,
+    action: str,
+    target_type: str,
+    target_label: str,
+    summary: str,
+    level: AuditLogLevel = AuditLogLevel.INFO,
+    detail: str | None = None,
+    target_id: str | None = None,
+) -> None:
+    db.add(
+        AuditLog(
+            school_id=school.id,
+            actor_user_id=principal.user_id,
+            actor_username=principal.username,
+            actor_display_name=principal.display_name,
+            actor_role=principal.role,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            target_label=target_label,
+            level=level,
+            summary=summary,
+            detail=detail,
+        )
+    )
 
 
 def _ensure_manageable_role(principal: Principal, role: UserRole) -> None:
@@ -543,6 +667,8 @@ def _overview_payload(db: Session, principal: Principal, school_code: str | None
         academic_terms=academic_terms,
         classrooms=classrooms,
         resource_categories=_serialize_resource_categories(db, current_school),
+        backup_snapshots=_serialize_backup_snapshots(db, current_school),
+        recent_audit_logs=_serialize_recent_audit_logs(db, current_school),
         teacher_accounts=teacher_accounts,
         students=students,
         active_migration=_serialize_batch(batch),
@@ -554,6 +680,7 @@ def _overview_payload(db: Session, principal: Principal, school_code: str | None
             "所有导入批次都必须支持 dry-run 预检。",
             "有 warning 或 error 的预览行必须先人工修复，再允许执行迁移。",
             "学校管理员默认只可操作本校数据，跨校治理需要更高权限。",
+            "执行本地 SQLite 备份或恢复前，应先确认当前环境仅用于开发验证。",
         ],
     )
 
@@ -565,6 +692,133 @@ def admin_overview(
     db: Session = Depends(get_db),
 ) -> AdminOverviewResponse:
     return _overview_payload(db, principal, school_code)
+
+
+@router.post("/school-settings", response_model=AdminOverviewResponse)
+def update_school_settings(
+    payload: SchoolSettingsUpdateRequest,
+    school_code: str | None = Query(default=None),
+    principal: Principal = Depends(require_roles(UserRole.SCHOOL_ADMIN, UserRole.PLATFORM_ADMIN)),
+    db: Session = Depends(get_db),
+) -> AdminOverviewResponse:
+    school = _resolve_scope_school(db, principal, school_code)
+
+    name = payload.name.strip()
+    city = payload.city.strip()
+    slogan = payload.slogan.strip()
+    if not name or not city or not slogan:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="School name, city, and slogan are required.",
+        )
+
+    school.name = name
+    school.city = city
+    school.slogan = slogan
+    school.theme_style = payload.theme_style
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="school_settings_updated",
+        target_type="school",
+        target_label=school.name,
+        target_id=str(school.id),
+        summary=f"Updated school settings for {school.name}",
+        detail=f"city={school.city}; theme_style={school.theme_style.value}",
+    )
+    db.commit()
+    return _overview_payload(db, principal, school.code)
+
+
+@router.post("/backups", response_model=AdminOverviewResponse)
+def create_backup_snapshot(
+    payload: BackupCreateRequest,
+    school_code: str | None = Query(default=None),
+    principal: Principal = Depends(require_roles(UserRole.SCHOOL_ADMIN, UserRole.PLATFORM_ADMIN)),
+    db: Session = Depends(get_db),
+) -> AdminOverviewResponse:
+    _require_platform_backup_operator(principal)
+    school = _resolve_scope_school(db, principal, school_code)
+    file_name = build_backup_filename(school.code)
+    try:
+        storage_path, file_size = create_sqlite_backup(file_name)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    snapshot = BackupSnapshot(
+        school_id=school.id,
+        school_name=school.name,
+        actor_user_id=principal.user_id,
+        actor_username=principal.username,
+        actor_display_name=principal.display_name,
+        actor_role=principal.role,
+        file_name=file_name,
+        storage_path=storage_path,
+        file_size=file_size,
+        status=BackupSnapshotStatus.READY,
+        note=payload.note.strip() if payload.note and payload.note.strip() else None,
+    )
+    db.add(snapshot)
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="backup_created",
+        target_type="backup_snapshot",
+        target_label=file_name,
+        target_id=file_name,
+        level=AuditLogLevel.WARNING,
+        summary=f"创建本地备份快照 {file_name}",
+        detail=payload.note.strip() if payload.note and payload.note.strip() else None,
+    )
+    db.commit()
+    return _overview_payload(db, principal, school.code)
+
+
+@router.post("/backups/{snapshot_id}/restore", response_model=MessageResponse)
+def restore_backup_snapshot(
+    snapshot_id: int,
+    school_code: str | None = Query(default=None),
+    principal: Principal = Depends(require_roles(UserRole.SCHOOL_ADMIN, UserRole.PLATFORM_ADMIN)),
+    db: Session = Depends(get_db),
+) -> MessageResponse:
+    _require_platform_backup_operator(principal)
+    school = _resolve_scope_school(db, principal, school_code)
+    snapshot = _get_backup_snapshot(db, school, snapshot_id)
+    storage_path = snapshot.storage_path
+    file_name = snapshot.file_name
+    db.close()
+    engine.dispose()
+    try:
+        restore_sqlite_backup(storage_path)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    with SessionLocal() as restore_db:
+        restored_school = restore_db.scalar(select(School).where(School.code == school.code)) or school
+        restored_snapshot = restore_db.scalar(select(BackupSnapshot).where(BackupSnapshot.storage_path == storage_path))
+        if restored_snapshot is not None:
+            restored_snapshot.status = BackupSnapshotStatus.RESTORED
+            restored_snapshot.restored_at = utc_now()
+        _append_audit_log(
+            restore_db,
+            principal,
+            restored_school,
+            action="backup_restored",
+            target_type="backup_snapshot",
+            target_label=file_name,
+            target_id=file_name,
+            level=AuditLogLevel.RISK,
+            summary=f"从本地备份快照恢复数据库：{file_name}",
+            detail="恢复操作会覆盖当前本地 SQLite 数据文件。",
+        )
+        restore_db.commit()
+
+    return MessageResponse(
+        message=f"Backup snapshot restored: {file_name}",
+        updated_at=utc_now(),
+    )
 
 
 @router.post("/resource-categories", response_model=AdminOverviewResponse)
@@ -585,14 +839,24 @@ def create_resource_category(
     if existing is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Resource category already exists.")
 
-    db.add(
-        ResourceCategory(
-            school_id=school.id,
-            name=normalized_name,
-            description=payload.description.strip() if payload.description and payload.description.strip() else None,
-            sort_order=payload.sort_order,
-            active=True,
-        )
+    category = ResourceCategory(
+        school_id=school.id,
+        name=normalized_name,
+        description=payload.description.strip() if payload.description and payload.description.strip() else None,
+        sort_order=payload.sort_order,
+        active=True,
+    )
+    db.add(category)
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="resource_category_created",
+        target_type="resource_category",
+        target_label=normalized_name,
+        target_id=str(category.id) if category.id is not None else None,
+        summary=f"创建资源分类：{normalized_name}",
+        detail=category.description,
     )
     db.commit()
     return _overview_payload(db, principal, school.code)
@@ -621,6 +885,17 @@ def update_resource_category_status(
                 detail="At least one active resource category must remain available.",
             )
     category.active = payload.active
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="resource_category_status_updated",
+        target_type="resource_category",
+        target_label=category.name,
+        target_id=str(category.id),
+        level=AuditLogLevel.WARNING if not payload.active else AuditLogLevel.INFO,
+        summary=f"{'启用' if payload.active else '停用'}资源分类：{category.name}",
+    )
     db.commit()
     return _overview_payload(db, principal, school.code)
 
@@ -662,6 +937,16 @@ def create_term(
         sort_order=len(existing_terms) + 1,
     )
     db.add(term)
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="term_created",
+        target_type="academic_term",
+        target_label=f"{term.school_year_label} · {term.term_name}",
+        summary=f"创建学期：{term.school_year_label} · {term.term_name}",
+        detail="创建后立即激活当前学期。" if payload.activate_now else None,
+    )
     db.commit()
     return _overview_payload(db, principal, school.code)
 
@@ -677,6 +962,16 @@ def activate_term(
     term = _get_term(db, school, term_id)
     _deactivate_terms(db, school.id)
     term.is_active = True
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="term_activated",
+        target_type="academic_term",
+        target_label=f"{term.school_year_label} · {term.term_name}",
+        target_id=str(term.id),
+        summary=f"切换当前学期：{term.school_year_label} · {term.term_name}",
+    )
     db.commit()
     return _overview_payload(db, principal, school.code)
 
@@ -710,6 +1005,7 @@ def save_teacher_account(
     if conflict is not None and (account is None or conflict.id != account.id):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already exists in this school.")
 
+    created = account is None
     if account is None:
         account = User(
             school_id=school.id,
@@ -733,6 +1029,18 @@ def save_teacher_account(
     else:
         _sync_teacher_classroom_assignments(db, school, account, [])
 
+    assignment_summary = "、".join(map(str, payload.classroom_ids)) if payload.classroom_ids else "全校治理视图"
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="teacher_account_created" if created else "teacher_account_updated",
+        target_type="teacher_account",
+        target_label=f"{display_name} ({username})",
+        target_id=str(account.id) if account.id is not None else None,
+        summary=f"{'创建' if created else '更新'}教师账号：{display_name} ({username})",
+        detail=f"角色：{role.value}；班级：{assignment_summary}",
+    )
     db.commit()
     return _overview_payload(db, principal, school.code)
 
@@ -749,6 +1057,17 @@ def reset_teacher_password(
     teacher = _get_teacher_account(db, school, teacher_id)
     _ensure_manageable_teacher(principal, teacher)
     teacher.password_hash = hash_password(payload.new_password)
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="teacher_password_reset",
+        target_type="teacher_account",
+        target_label=f"{teacher.display_name} ({teacher.username})",
+        target_id=str(teacher.id),
+        level=AuditLogLevel.WARNING,
+        summary=f"重置教师密码：{teacher.display_name} ({teacher.username})",
+    )
     db.commit()
     return _overview_payload(db, principal, school.code)
 
@@ -765,6 +1084,17 @@ def update_teacher_status(
     teacher = _get_teacher_account(db, school, teacher_id)
     _ensure_manageable_teacher(principal, teacher)
     teacher.active = payload.active
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="teacher_status_updated",
+        target_type="teacher_account",
+        target_label=f"{teacher.display_name} ({teacher.username})",
+        target_id=str(teacher.id),
+        level=AuditLogLevel.WARNING if not payload.active else AuditLogLevel.INFO,
+        summary=f"{'启用' if payload.active else '停用'}教师账号：{teacher.display_name} ({teacher.username})",
+    )
     db.commit()
     return _overview_payload(db, principal, school.code)
 
@@ -781,6 +1111,16 @@ def assign_student_classroom(
     student = _get_student(db, school, student_id)
     classroom = _get_classroom(db, school, payload.classroom_id)
     student.classroom_id = classroom.id
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="student_classroom_assigned",
+        target_type="student_account",
+        target_label=f"{student.display_name} ({student.username})",
+        target_id=str(student.id),
+        summary=f"调整学生编班：{student.display_name} -> {classroom.name}",
+    )
     db.commit()
     return _overview_payload(db, principal, school.code)
 
@@ -796,6 +1136,17 @@ def reset_student_password(
     school = _resolve_scope_school(db, principal, school_code)
     student = _get_student(db, school, student_id)
     student.password_hash = hash_password(payload.new_password)
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="student_password_reset",
+        target_type="student_account",
+        target_label=f"{student.display_name} ({student.username})",
+        target_id=str(student.id),
+        level=AuditLogLevel.WARNING,
+        summary=f"重置学生密码：{student.display_name} ({student.username})",
+    )
     db.commit()
     return _overview_payload(db, principal, school.code)
 
@@ -811,6 +1162,17 @@ def update_student_status(
     school = _resolve_scope_school(db, principal, school_code)
     student = _get_student(db, school, student_id)
     student.active = payload.active
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="student_status_updated",
+        target_type="student_account",
+        target_label=f"{student.display_name} ({student.username})",
+        target_id=str(student.id),
+        level=AuditLogLevel.WARNING if not payload.active else AuditLogLevel.INFO,
+        summary=f"{'启用' if payload.active else '停用'}学生账号：{student.display_name} ({student.username})",
+    )
     db.commit()
     return _overview_payload(db, principal, school.code)
 
@@ -868,6 +1230,18 @@ def import_students(
         )
         imported_count += 1
 
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="student_import_completed",
+        target_type="classroom",
+        target_label=classroom.name,
+        target_id=str(classroom.id),
+        level=AuditLogLevel.WARNING,
+        summary=f"批量导入学生到 {classroom.name}",
+        detail=f"新增 {imported_count}，更新 {updated_count}，跳过 {skipped_count}",
+    )
     db.commit()
     return AdminStudentImportResponse(
         overview=_overview_payload(db, principal, school.code),
@@ -914,9 +1288,20 @@ def resolve_preview_item(
     preview_item.status = payload.status
     preview_item.resolution_note = payload.resolution_note
     preview_item.resolved_by_user_id = principal.user_id
-    preview_item.resolved_at = datetime.utcnow()
+    preview_item.resolved_at = utc_now()
 
     _recalculate_batch_health(batch)
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="migration_preview_resolved",
+        target_type="migration_preview_item",
+        target_label=preview_item.field_name,
+        target_id=str(preview_item.id),
+        summary=f"修复迁移预览项：{preview_item.field_name}",
+        detail=payload.resolution_note,
+    )
     db.commit()
     return _overview_payload(db, principal, school.code)
 
@@ -976,6 +1361,17 @@ def execute_migration(
     batch.current_step = "迁移执行完成，可以开始核验结果。"
     batch.progress = 100
     batch.error_count = 0
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="migration_executed",
+        target_type="migration_batch",
+        target_label=batch.name,
+        target_id=str(batch.id),
+        level=AuditLogLevel.RISK,
+        summary=f"执行迁移批次：{batch.name}",
+    )
     db.commit()
     return _overview_payload(db, principal, school.code)
 
@@ -1004,6 +1400,17 @@ def rollback_migration(
     batch.status = MigrationStatus.ROLLED_BACK
     batch.progress = 0
     batch.current_step = "已回滚本批次执行结果，等待重新确认。"
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="migration_rolled_back",
+        target_type="migration_batch",
+        target_label=batch.name,
+        target_id=str(batch.id),
+        level=AuditLogLevel.RISK,
+        summary=f"回滚迁移批次：{batch.name}",
+    )
     db.commit()
     return _overview_payload(db, principal, school.code)
 
@@ -1020,5 +1427,16 @@ def reset_migration_status(
     batch.status = MigrationStatus.PREVIEWED
     batch.progress = 68
     batch.current_step = "已恢复到预览确认阶段。"
+    _append_audit_log(
+        db,
+        principal,
+        school,
+        action="migration_reset",
+        target_type="migration_batch",
+        target_label=batch.name,
+        target_id=str(batch.id),
+        level=AuditLogLevel.WARNING,
+        summary=f"重置迁移批次状态：{batch.name}",
+    )
     db.commit()
     return MessageResponse(message="Migration batch reset.", updated_at=batch.updated_at)

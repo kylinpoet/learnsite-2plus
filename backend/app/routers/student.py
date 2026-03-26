@@ -1,21 +1,26 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..core.auth import Principal, require_roles
+from ..core.clock import utc_now
 from ..core.database import get_db
 from ..core.resource_storage import resolve_resource_path
 from ..models import (
+    ActivitySubmission,
     AttendanceRecord,
     AttendanceStatus,
     ClassSession,
     Classroom,
     Course,
+    CourseActivity,
     HelpRequest,
     LearningResource,
     PresenceState,
@@ -32,10 +37,19 @@ from ..models import (
     UserRole,
 )
 from ..schemas import (
+    ActivitySubmissionResponse,
+    ActivitySubmissionSummary,
     HeartbeatRequest,
     HelpRequestCreate,
     MessageResponse,
+    CourseActivitySummary,
     StudentResourceSummary,
+    StudentActivityDetailResponse,
+    StudentAssignmentsResponse,
+    StudentAttendanceHistoryEntry,
+    StudentAttendanceResponse,
+    StudentDashboardResponse,
+    StudentResourcesResponse,
     StudentHomeResponse,
     StudentSubmissionSummary,
     SubmissionActionResponse,
@@ -61,6 +75,18 @@ def _format_file_size(file_size: int) -> str:
     if file_size < 1024 * 1024:
         return f"{round(file_size / 1024, 1)} KB"
     return f"{round(file_size / (1024 * 1024), 1)} MB"
+
+
+def _build_public_activity_launch_url(activity: CourseActivity) -> str | None:
+    if not activity.interactive_launch_key or not activity.interactive_entry_file:
+        return None
+    return f"/api/public/activities/{activity.interactive_launch_key}/{activity.interactive_entry_file}"
+
+
+def _build_public_activity_submission_url(activity: CourseActivity) -> str | None:
+    if not activity.interactive_submission_key:
+        return None
+    return f"/api/public/activities/{activity.interactive_submission_key}/submit"
 
 
 def _shorten(text: str, *, limit: int = 72) -> str:
@@ -133,7 +159,7 @@ def _get_or_create_presence(db: Session, principal: Principal, session_id: int, 
             status=PresenceStatus.NOT_STARTED,
             task_progress=0,
             help_requested=False,
-            last_seen_at=datetime.utcnow(),
+            last_seen_at=utc_now(),
         )
         db.add(presence)
         db.flush()
@@ -198,6 +224,48 @@ def _serialize_submission(submission: Submission | None, reviewer_name: str | No
         reviewed_by=reviewer_name,
         can_edit=can_edit,
     )
+
+
+def _serialize_activity_submission(submission: ActivitySubmission) -> ActivitySubmissionSummary:
+    return ActivitySubmissionSummary(
+        id=submission.id,
+        submitted_by_name=submission.submitted_by_name,
+        submitted_at=_format_full(submission.created_at),
+        payload_preview=_shorten(submission.payload_json, limit=120),
+    )
+
+
+def _serialize_course_activity(activity: CourseActivity, *, student_id: int | None = None) -> CourseActivitySummary:
+    submissions = sorted(activity.submissions, key=lambda item: item.created_at, reverse=True)
+    latest_submission = submissions[0] if submissions else None
+    if student_id is not None:
+        student_submissions = [item for item in submissions if item.submitted_by_user_id == student_id]
+        if student_submissions:
+            latest_submission = student_submissions[0]
+            submissions = student_submissions
+
+    return CourseActivitySummary(
+        id=activity.id,
+        title=activity.title,
+        activity_type=activity.activity_type,
+        position=activity.position,
+        summary=activity.summary,
+        instructions_html=activity.instructions_html or "",
+        has_interactive_asset=bool(activity.interactive_storage_key and activity.interactive_entry_file),
+        interactive_asset_name=activity.interactive_asset_name,
+        interactive_launch_url=_build_public_activity_launch_url(activity),
+        interactive_preview_url=_build_public_activity_launch_url(activity),
+        interactive_submission_api_url=_build_public_activity_submission_url(activity),
+        submission_count=len(submissions),
+        last_submitted_at=_format_full(latest_submission.created_at) if latest_submission else None,
+        latest_submission=_serialize_activity_submission(latest_submission) if latest_submission else None,
+        recent_submissions=[_serialize_activity_submission(item) for item in submissions[:3]],
+    )
+
+
+def _list_course_activities(course: Course, *, student_id: int | None = None) -> list[CourseActivitySummary]:
+    activities = sorted(course.activities, key=lambda item: item.position)
+    return [_serialize_course_activity(activity, student_id=student_id) for activity in activities]
 
 
 def _serialize_student_resource(db: Session, resource: LearningResource) -> StudentResourceSummary:
@@ -324,6 +392,48 @@ def _build_submission_history(db: Session, submission: Submission | None) -> lis
     return [item[1] for item in rows]
 
 
+def _build_attendance_history(db: Session, student: User) -> list[StudentAttendanceHistoryEntry]:
+    records = db.scalars(
+        select(AttendanceRecord)
+        .where(
+            AttendanceRecord.school_id == student.school_id,
+            AttendanceRecord.user_id == student.id,
+        )
+        .order_by(AttendanceRecord.created_at.desc(), AttendanceRecord.id.desc())
+    ).all()
+    history: list[StudentAttendanceHistoryEntry] = []
+    for record in records[:8]:
+        session_obj = db.get(ClassSession, record.session_id)
+        classroom = db.get(Classroom, session_obj.classroom_id) if session_obj else None
+        history.append(
+            StudentAttendanceHistoryEntry(
+                session_id=record.session_id,
+                lesson_title=session_obj.title if session_obj else "Archived lesson",
+                class_name=classroom.name if classroom else "Unknown classroom",
+                status=record.status,
+                marked_at=_format_hm(record.marked_at),
+                started_at=_format_full(session_obj.started_at) if session_obj else _format_full(record.created_at),
+            )
+        )
+    return history
+
+
+def _get_course_activity(
+    db: Session,
+    principal: Principal,
+    activity_id: int,
+) -> CourseActivity:
+    activity = db.scalar(
+        select(CourseActivity).where(
+            CourseActivity.id == activity_id,
+            CourseActivity.school_id == principal.school_id,
+        )
+    )
+    if activity is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course activity not found.")
+    return activity
+
+
 def _record_submission_revision(
     db: Session,
     submission: Submission,
@@ -340,7 +450,7 @@ def _record_submission_revision(
             title=submission.title,
             content=submission.content,
             action=action,
-            created_at=datetime.utcnow(),
+            created_at=utc_now(),
         )
     )
 
@@ -360,7 +470,7 @@ def _upsert_submission(
             Submission.user_id == user_id,
         )
     )
-    now = datetime.utcnow()
+    now = utc_now()
     presence = _get_or_create_presence(db, principal, session_id, user_id)
 
     if submission is None:
@@ -416,12 +526,180 @@ def _upsert_submission(
     return submission, presence
 
 
+def _build_student_home_response(db: Session, principal: Principal, student: User) -> StudentHomeResponse:
+    classroom = db.get(Classroom, student.classroom_id) if student.classroom_id else None
+    active_session = _find_active_session(db, principal.school_id, student.classroom_id)
+    if active_session is None:
+        return _build_idle_home_response(db, principal, student, classroom)
+
+    session_obj, course, classroom = active_session
+    presence = _get_or_create_presence(db, principal, session_obj.id, student.id)
+    attendance = _get_or_create_attendance(db, principal, session_obj.id, student.id)
+    submission = db.scalar(
+        select(Submission).where(
+            Submission.session_id == session_obj.id,
+            Submission.user_id == student.id,
+        )
+    )
+
+    reviewer_name = None
+    if submission and submission.reviewed_by_user_id:
+        reviewer = db.get(User, submission.reviewed_by_user_id)
+        reviewer_name = reviewer.display_name if reviewer else None
+
+    saved_label = "尚未保存"
+    if submission and submission.draft_saved_at:
+        saved_label = _format_hm(submission.draft_saved_at) or saved_label
+
+    todo_items = [
+        TodoItem(title="阅读本节任务说明", status="done"),
+        TodoItem(title="完成课堂作品草稿", status="done" if submission else "active"),
+        TodoItem(
+            title="正式提交课堂作品",
+            status="done" if submission and submission.status != SubmissionStatus.DRAFT else "pending",
+        ),
+    ]
+    if submission and submission.status == SubmissionStatus.REVIEWED and _can_edit_reviewed_submission(submission):
+        todo_items.append(TodoItem(title="根据教师反馈修改后重交", status="active"))
+
+    return StudentHomeResponse(
+        school_name=principal.school_name,
+        student_name=student.display_name,
+        class_name=classroom.name,
+        lesson_title=course.title,
+        lesson_stage=session_obj.stage,
+        assignment_title=course.assignment_title,
+        assignment_prompt=course.assignment_prompt,
+        session_status=session_obj.status,
+        progress_percent=presence.task_progress,
+        progress_summary="先整理课堂观察、图表或结论，再保存草稿；确认无误后正式提交给老师。",
+        saved_at=saved_label,
+        todo_items=todo_items,
+        highlights=[
+            "支持先保存草稿，再正式提交，避免课堂中途丢失内容。",
+            "老师批改后，你可以在同一门户查看反馈和提交历史。",
+            "如果卡住了，可以随时举手求助，教师端会实时收到提醒。",
+        ],
+        help_open=presence.help_requested,
+        attendance_status=attendance.status,
+        submission=_serialize_submission(submission, reviewer_name),
+        submission_history=_build_submission_history(db, submission),
+        resources=_list_student_resources(db, principal, student),
+    )
+
+
+def _build_student_dashboard_response(db: Session, principal: Principal, student: User) -> StudentDashboardResponse:
+    home = _build_student_home_response(db, principal, student)
+    return StudentDashboardResponse(
+        school_name=home.school_name,
+        student_name=home.student_name,
+        class_name=home.class_name,
+        lesson_title=home.lesson_title,
+        lesson_stage=home.lesson_stage,
+        session_status=home.session_status,
+        progress_percent=home.progress_percent,
+        progress_summary=home.progress_summary,
+        todo_items=home.todo_items,
+        highlights=home.highlights,
+        help_open=home.help_open,
+        attendance_status=home.attendance_status,
+    )
+
+
+def _build_student_attendance_response(db: Session, principal: Principal, student: User) -> StudentAttendanceResponse:
+    classroom = db.get(Classroom, student.classroom_id) if student.classroom_id else None
+    active_session = _find_active_session(db, principal.school_id, student.classroom_id)
+    history = _build_attendance_history(db, student)
+    if active_session is None:
+        return StudentAttendanceResponse(
+            session_id=None,
+            school_name=principal.school_name,
+            student_name=student.display_name,
+            class_name=classroom.name if classroom else "未分班",
+            lesson_title="当前暂无进行中的课堂",
+            session_status="idle",
+            attendance_status=AttendanceStatus.PENDING,
+            checked_in_at=None,
+            last_seen_at=None,
+            can_check_in=False,
+            help_open=False,
+            attendance_history=history,
+        )
+
+    session_obj, course, classroom = active_session
+    presence = _get_or_create_presence(db, principal, session_obj.id, student.id)
+    attendance = _get_or_create_attendance(db, principal, session_obj.id, student.id)
+    return StudentAttendanceResponse(
+        session_id=session_obj.id,
+        school_name=principal.school_name,
+        student_name=student.display_name,
+        class_name=classroom.name,
+        lesson_title=course.title,
+        session_status=session_obj.status,
+        attendance_status=attendance.status,
+        checked_in_at=_format_hm(attendance.marked_at),
+        last_seen_at=_format_full(presence.last_seen_at),
+        can_check_in=attendance.status == AttendanceStatus.PENDING,
+        help_open=presence.help_requested,
+        attendance_history=history,
+    )
+
+
+def _build_student_assignments_response(db: Session, principal: Principal, student: User) -> StudentAssignmentsResponse:
+    home = _build_student_home_response(db, principal, student)
+    active_session = _find_active_session(db, principal.school_id, student.classroom_id)
+    activities: list[CourseActivitySummary] = []
+    session_id: int | None = None
+    if active_session is not None:
+        session_obj, course, _ = active_session
+        session_id = session_obj.id
+        activities = _list_course_activities(course, student_id=student.id)
+
+    return StudentAssignmentsResponse(
+        session_id=session_id,
+        school_name=home.school_name,
+        student_name=home.student_name,
+        class_name=home.class_name,
+        lesson_title=home.lesson_title,
+        lesson_stage=home.lesson_stage,
+        assignment_title=home.assignment_title,
+        assignment_prompt=home.assignment_prompt,
+        session_status=home.session_status,
+        submission=home.submission,
+        submission_history=home.submission_history,
+        activities=activities,
+    )
+
+
+def _build_student_activity_detail_response(
+    db: Session,
+    principal: Principal,
+    student: User,
+    activity: CourseActivity,
+) -> StudentActivityDetailResponse:
+    active_session = _find_active_session(db, principal.school_id, student.classroom_id)
+    if active_session is None or active_session[1].id != activity.course_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Activity is not available in the current context.")
+
+    session_obj, course, classroom = active_session
+    return StudentActivityDetailResponse(
+        session_id=session_obj.id,
+        school_name=principal.school_name,
+        student_name=student.display_name,
+        class_name=classroom.name,
+        lesson_title=course.title,
+        session_status=session_obj.status,
+        activity=_serialize_course_activity(activity, student_id=student.id),
+    )
+
+
 @router.get("/home", response_model=StudentHomeResponse)
 def student_home(
     principal: Principal = Depends(require_roles(UserRole.STUDENT)),
     db: Session = Depends(get_db),
 ) -> StudentHomeResponse:
     student = _get_student(db, principal)
+    return _build_student_home_response(db, principal, student)
     classroom = db.get(Classroom, student.classroom_id) if student.classroom_id else None
     active_session = _find_active_session(db, principal.school_id, student.classroom_id)
     if active_session is None:
@@ -483,6 +761,119 @@ def student_home(
     )
 
 
+@router.get("/dashboard", response_model=StudentDashboardResponse)
+def student_dashboard(
+    principal: Principal = Depends(require_roles(UserRole.STUDENT)),
+    db: Session = Depends(get_db),
+) -> StudentDashboardResponse:
+    student = _get_student(db, principal)
+    return _build_student_dashboard_response(db, principal, student)
+
+
+@router.get("/attendance", response_model=StudentAttendanceResponse)
+def student_attendance(
+    principal: Principal = Depends(require_roles(UserRole.STUDENT)),
+    db: Session = Depends(get_db),
+) -> StudentAttendanceResponse:
+    student = _get_student(db, principal)
+    return _build_student_attendance_response(db, principal, student)
+
+
+@router.post("/attendance/check-in", response_model=MessageResponse)
+def student_check_in(
+    principal: Principal = Depends(require_roles(UserRole.STUDENT)),
+    db: Session = Depends(get_db),
+) -> MessageResponse:
+    student = _get_student(db, principal)
+    session_obj, _, _ = _get_active_session(db, principal.school_id, student.classroom_id)
+    presence = _get_or_create_presence(db, principal, session_obj.id, student.id)
+    attendance = _get_or_create_attendance(db, principal, session_obj.id, student.id)
+
+    now = utc_now()
+    presence.status = PresenceStatus.ACTIVE
+    presence.last_seen_at = now
+    presence.task_progress = max(presence.task_progress, 10)
+    attendance.status = AttendanceStatus.PRESENT
+    attendance.marked_at = now
+    db.commit()
+    return MessageResponse(message="Check-in completed.", updated_at=now)
+
+
+@router.get("/assignments", response_model=StudentAssignmentsResponse)
+def student_assignments(
+    principal: Principal = Depends(require_roles(UserRole.STUDENT)),
+    db: Session = Depends(get_db),
+) -> StudentAssignmentsResponse:
+    student = _get_student(db, principal)
+    return _build_student_assignments_response(db, principal, student)
+
+
+@router.get("/activities/{activity_id}", response_model=StudentActivityDetailResponse)
+def student_activity_detail(
+    activity_id: int,
+    principal: Principal = Depends(require_roles(UserRole.STUDENT)),
+    db: Session = Depends(get_db),
+) -> StudentActivityDetailResponse:
+    student = _get_student(db, principal)
+    activity = _get_course_activity(db, principal, activity_id)
+    return _build_student_activity_detail_response(db, principal, student, activity)
+
+
+@router.post("/activities/{activity_id}/submissions", response_model=ActivitySubmissionResponse)
+def student_activity_submission(
+    activity_id: int,
+    payload: Any = Body(default={}),
+    principal: Principal = Depends(require_roles(UserRole.STUDENT)),
+    db: Session = Depends(get_db),
+) -> ActivitySubmissionResponse:
+    student = _get_student(db, principal)
+    activity = _get_course_activity(db, principal, activity_id)
+    active_session = _find_active_session(db, principal.school_id, student.classroom_id)
+    if active_session is None or active_session[1].id != activity.course_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interactive activity is not active for the current student.")
+
+    session_obj, _, _ = active_session
+    presence = _get_or_create_presence(db, principal, session_obj.id, student.id)
+    payload_json = json.dumps(payload, ensure_ascii=False, default=str)
+    now = utc_now()
+    submission = ActivitySubmission(
+        school_id=principal.school_id,
+        course_id=activity.course_id,
+        activity_id=activity.id,
+        session_id=session_obj.id,
+        submitted_by_user_id=student.id,
+        submitted_by_name=student.display_name,
+        payload_json=payload_json,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(submission)
+
+    presence.status = PresenceStatus.ACTIVE
+    presence.last_seen_at = now
+    presence.task_progress = max(presence.task_progress, 96)
+    db.commit()
+    db.refresh(submission)
+    return ActivitySubmissionResponse(
+        message="Interactive activity submission received.",
+        submission=_serialize_activity_submission(submission),
+        updated_at=now,
+    )
+
+
+@router.get("/resources", response_model=StudentResourcesResponse)
+def student_resources(
+    principal: Principal = Depends(require_roles(UserRole.STUDENT)),
+    db: Session = Depends(get_db),
+) -> StudentResourcesResponse:
+    student = _get_student(db, principal)
+    return StudentResourcesResponse(
+        school_name=principal.school_name,
+        student_name=student.display_name,
+        resources=_list_student_resources(db, principal, student),
+    )
+
+
 @router.post("/heartbeat", response_model=MessageResponse)
 def heartbeat(
     payload: HeartbeatRequest,
@@ -494,7 +885,7 @@ def heartbeat(
     presence = _get_or_create_presence(db, principal, session_obj.id, student.id)
     attendance = _get_or_create_attendance(db, principal, session_obj.id, student.id)
 
-    now = datetime.utcnow()
+    now = utc_now()
     presence.status = PresenceStatus.ACTIVE
     presence.last_seen_at = now
     presence.task_progress = max(presence.task_progress, payload.task_progress)
@@ -516,7 +907,7 @@ def create_help_request(
     session_obj, _, _ = _get_active_session(db, principal.school_id, student.classroom_id)
     presence = _get_or_create_presence(db, principal, session_obj.id, student.id)
 
-    now = datetime.utcnow()
+    now = utc_now()
     presence.help_requested = True
     presence.last_seen_at = now
     db.add(
@@ -551,7 +942,7 @@ def save_submission_draft(
     db.commit()
     db.refresh(submission)
     reviewer_name = None
-    updated_at = submission.draft_saved_at or datetime.utcnow()
+    updated_at = submission.draft_saved_at or utc_now()
     return SubmissionActionResponse(
         message="Draft saved.",
         submission=_serialize_submission(submission, reviewer_name),
@@ -578,7 +969,7 @@ def submit_assignment(
     db.commit()
     db.refresh(submission)
     reviewer_name = None
-    updated_at = submission.submitted_at or datetime.utcnow()
+    updated_at = submission.submitted_at or utc_now()
     return SubmissionActionResponse(
         message="Submission completed.",
         submission=_serialize_submission(submission, reviewer_name),

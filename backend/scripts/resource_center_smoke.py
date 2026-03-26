@@ -18,9 +18,11 @@ def main() -> None:
         temp_path = Path(temp_dir)
         sqlite_path = temp_path / "resource_smoke.sqlite3"
         storage_path = temp_path / "resource_storage"
+        backup_path = temp_path / "backup_storage"
 
         os.environ["LEARNSITE_SQLITE_URL"] = f"sqlite:///{sqlite_path.resolve().as_posix()}"
         os.environ["LEARNSITE_RESOURCE_STORAGE_DIR"] = str(storage_path.resolve())
+        os.environ["LEARNSITE_BACKUP_STORAGE_DIR"] = str(backup_path.resolve())
 
         from fastapi.testclient import TestClient
         from sqlalchemy import select
@@ -166,6 +168,24 @@ def main() -> None:
             admin_school_resource = admin_school_upload.json()
             assert admin_school_resource["category_name"], admin_school_resource
 
+            admin_backup = client.post(
+                "/api/admin/backups",
+                headers=auth_headers(admin_token),
+                json={"note": "resource center governance smoke backup"},
+            )
+            assert admin_backup.status_code == 200, admin_backup.text
+            admin_backup_overview = admin_backup.json()
+            assert admin_backup_overview["backup_snapshots"], admin_backup_overview
+            latest_backup = admin_backup_overview["backup_snapshots"][0]
+            assert latest_backup["note"] == "resource center governance smoke backup", latest_backup
+            assert latest_backup["file_size"] > 0, latest_backup
+            assert any(
+                log["action"] == "backup_created" for log in admin_backup_overview["recent_audit_logs"]
+            ), admin_backup_overview["recent_audit_logs"]
+            assert any(
+                log["action"] == "resource_category_created" for log in admin_backup_overview["recent_audit_logs"]
+            ), admin_backup_overview["recent_audit_logs"]
+
             student_token = login(client, "student", "school-a", "240101", "12345")
             active_home = client.get("/api/student/home", headers=auth_headers(student_token))
             assert active_home.status_code == 200, active_home.text
@@ -251,6 +271,7 @@ def main() -> None:
                         "teacher_resource_id": teacher_resource["id"],
                         "teacher_resource_category_id": teacher_category_id,
                         "created_category_id": created_category["id"],
+                        "backup_snapshot_id": latest_backup["id"],
                         "admin_class_resource_id": admin_class_resource["id"],
                         "admin_school_resource_id": admin_school_resource["id"],
                         "active_resource_ids": sorted(active_resource_ids),

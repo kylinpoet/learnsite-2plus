@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue'
 import type { LoginRole, SessionInfo } from '../api/types'
-import { SESSION_STORAGE_KEY, readStoredSession } from '../api/client'
+import { SESSION_STORAGE_KEY, clearStoredSession, readStoredSession } from '../api/client'
 
 const sessionState = ref<SessionInfo | null>(readStoredSession())
 
@@ -14,7 +14,7 @@ export function useSession() {
 
   function clearSession() {
     sessionState.value = null
-    localStorage.removeItem(SESSION_STORAGE_KEY)
+    clearStoredSession()
   }
 
   return {
@@ -30,7 +30,7 @@ export function getDefaultRouteForRole(role: LoginRole | SessionInfo['role']): s
     return '/student/home'
   }
   if (role === 'teacher' || role === 'school_admin' || role === 'platform_admin') {
-    return '/teacher/console'
+    return '/teacher/dashboard'
   }
   return '/'
 }

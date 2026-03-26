@@ -7,4 +7,5 @@ backend/learnsite.db
 backend/*.db
 backend/.env
 frontend/.env
+.gstack/
 *.pyc

@@ -22,12 +22,14 @@ const form = reactive({
 })
 
 async function loadBootstrap() {
+  loadError.value = ''
   try {
     const { data } = await apiClient.get<BootstrapResponse>('/bootstrap')
     bootstrap.value = data
     form.schoolCode = data.schools[0]?.code ?? ''
+    loadError.value = ''
   } catch (error) {
-    loadError.value = '暂时无法加载学校列表，请确认 FastAPI 服务已经启动。'
+    loadError.value = '暂时无法加载学校列表。请检查 FastAPI 服务、前端 API 地址，或点击重试。'
     console.error(error)
   }
 }
@@ -80,7 +82,10 @@ onMounted(() => {
         <p class="muted">测试账号：实验学校 A `240101 / 12345`，未来学校 B `250201 / 12345`。建议先选择学校，再进入学生首页。</p>
       </div>
 
-      <el-alert v-if="loadError" :closable="false" type="warning" :title="loadError" />
+      <div v-if="loadError" class="stack" style="gap: 12px;">
+        <el-alert :closable="false" type="warning" :title="loadError" />
+        <el-button plain @click="loadBootstrap">重新加载学校列表</el-button>
+      </div>
 
       <el-form label-position="top" @submit.prevent="submit">
         <el-form-item label="学校">
